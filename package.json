@@ -28,7 +28,7 @@
   "types": "./dist/esm/index.d.ts",
   "bin": {
     "sn-credstore": "./bin/sn-credstore.js",
-    "now-sdk-x": "./bin/now-sdk-wrapped.js"
+    "now-sdk-x": "./bin/now-sdk-wrapped.cjs"
   },
   "files": [
     "dist",
