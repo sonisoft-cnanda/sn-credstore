@@ -157,6 +157,16 @@ export class CredentialVault {
      * across the SDK's refresh and its setPassword.
      */
     private async takeRefreshLease(current: KeyStore): Promise<string> {
+        // Reentrancy. The SDK calls getCredentials more than once per command,
+        // so getPassword can fire again while we still hold the lease from the
+        // previous call. Without this check the process blocks on a lock it
+        // already owns and burns the full 20s timeout before falling through —
+        // observed live as "held by pid <self>, age 20786ms".
+        if (this.lease !== null) {
+            logger.debug('refresh lease already held by this process; reusing it');
+            return serializeKeyStore(current);
+        }
+
         let lock: LockHandle;
         try {
             lock = await acquireLock(this.lockPath, {

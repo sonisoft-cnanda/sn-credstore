@@ -176,4 +176,26 @@ describe('refresh lease — single-flight', () => {
         expect(JSON.parse(blob!).a.creds.access_token).toBe('refreshed');
         expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
     });
+
+    it('is reentrant — a second getPassword does not deadlock on our own lease', async () => {
+        // Regression: the SDK calls getCredentials more than once per command,
+        // so getPassword fires again while the lease from the first call is
+        // still held. This used to block on a lock the process already owned and
+        // burn the full 20s timeout. Observed live as "held by pid <self>".
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 300))); // inside the refresh window
+
+        const vault = makeVault(store);
+
+        const started = Date.now();
+        await vault.getPassword(); // takes the lease
+        await vault.getPassword(); // must reuse it, not wait on it
+        const elapsed = Date.now() - started;
+
+        // The bug made this take the full lock timeout (3000ms here).
+        expect(elapsed).toBeLessThan(1000);
+
+        await vault.setPassword(blobOf(oauth('a', 3600, 'refreshed')));
+        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
+    });
 });

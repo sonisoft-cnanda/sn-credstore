@@ -15,7 +15,7 @@
  */
 import Module, { createRequire } from 'node:module';
 import { dirname } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
 /**
  * This file is compiled to BOTH ESM and CJS, so the bare `require`,
@@ -51,6 +51,29 @@ export interface SdkCliCandidate {
     version: string | null;
 }
 
+
+/**
+ * Global node_modules roots, without shelling out to `npm root -g`.
+ *
+ * Derived from process.execPath so it follows nodenv/nvm/volta automatically:
+ *   <prefix>/bin/node  ->  <prefix>/lib/node_modules
+ * `npm root -g` would be authoritative but costs a subprocess on every shim
+ * install, which is on the hot path for every CLI invocation.
+ */
+function globalNodeModulesRoots(): string[] {
+    const roots: string[] = [];
+    try {
+        const prefix = dirname(dirname(process.execPath)); // .../bin/node -> ...
+        roots.push(`${prefix}/lib/node_modules`);
+    } catch {
+        /* non-standard layout */
+    }
+    if (process.env.NODE_PATH) {
+        for (const p of process.env.NODE_PATH.split(':')) if (p) roots.push(p);
+    }
+    return roots.filter((r) => existsSync(r));
+}
+
 function versionOfPackageAt(keychainPath: string): { root: string; version: string | null } {
     // dist/auth/keychain/index.js -> up four levels is the package root
     const root = dirname(dirname(dirname(dirname(keychainPath))));
@@ -73,6 +96,15 @@ export function findSdkCliCandidates(extraBases: string[] = []): SdkCliCandidate
     const bases = new Set<string>([process.cwd(), ...extraBases]);
 
     if (process.argv[1]) bases.add(dirname(process.argv[1]));
+
+    // The global install matters and is not reachable from cwd. `now-sdk` is
+    // typically installed with `npm i -g`, so the SDK — and the native
+    // @napi-rs/keyring beside it — live under the global root, which ordinary
+    // node resolution from a project directory will never find.
+    for (const globalRoot of globalNodeModulesRoots()) {
+        bases.add(globalRoot);
+        bases.add(`${globalRoot}/@servicenow/sdk`);
+    }
 
     const found = new Map<string, SdkCliCandidate>();
     for (const base of bases) {
