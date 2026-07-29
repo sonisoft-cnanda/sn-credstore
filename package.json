@@ -1,6 +1,6 @@
 {
   "name": "@sonisoft/sn-credstore",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Headless-safe credential storage for the ServiceNow SDK. Replaces the OS-keyring backend so non-interactive agents can authenticate.",
   "author": "Chris Nanda",
   "license": "MIT",
