@@ -97,7 +97,13 @@ export async function setDefaultAlias(
     const vault = vaultFor(config);
     const blob = await vault.getPassword();
     const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias] === undefined) return false;
+    if (store === null || store[alias] === undefined) {
+        // getPassword may have taken the refresh lease expecting a write to
+        // follow. There is no write, so hand it back rather than making the next
+        // writer wait out the 30s bail timer.
+        await vault.abandonLease();
+        return false;
+    }
 
     await vault.setPassword(serializeKeyStore(normalizeDefaults(store, alias)));
     return true;
@@ -117,7 +123,11 @@ export async function deleteAlias(
     const vault = vaultFor(config);
     const blob = await vault.getPassword();
     const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias] === undefined) return false;
+    if (store === null || store[alias] === undefined) {
+        // See setDefaultAlias — do not sit on a lease we will not use.
+        await vault.abandonLease();
+        return false;
+    }
 
     const next = { ...store };
     delete next[alias];

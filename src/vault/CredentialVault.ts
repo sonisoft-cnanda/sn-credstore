@@ -209,6 +209,19 @@ export class CredentialVault {
         }
     }
 
+    /**
+     * Drop a lease taken by a getPassword that will not be followed by a write.
+     *
+     * getPassword takes the refresh lease when a token is near expiry, on the
+     * assumption that the SDK's refresh + setPassword is about to follow. A
+     * caller that reads and then decides not to write (an alias that turns out
+     * not to exist, say) would otherwise hold it until the 30s bail timer fires,
+     * stalling the next writer for no reason.
+     */
+    async abandonLease(): Promise<void> {
+        await this.releaseLease();
+    }
+
     private async releaseLease(): Promise<void> {
         if (this.leaseTimer !== null) {
             clearTimeout(this.leaseTimer);
