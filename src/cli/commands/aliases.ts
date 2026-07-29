@@ -7,18 +7,10 @@
  */
 import { ResolvedConfig } from '../../config.js';
 import { createStore } from '../../store/StoreFactory.js';
-import { CredentialVault } from '../../vault/CredentialVault.js';
-import { parseKeyStore, serializeKeyStore } from '../../types.js';
-import { normalizeDefaults } from '../../vault/merge.js';
+import { parseKeyStore } from '../../types.js';
+import { deleteAlias, deleteAllAliases, setDefaultAlias } from '../../api.js';
 import { maskValue } from '../../redact.js';
 import { hasFlag } from '../main.js';
-
-function vaultFor(config: ResolvedConfig): CredentialVault {
-    return new CredentialVault(createStore(config), {
-        blobPath: config.blobPath,
-        lockTimeoutMs: config.lockTimeoutMs,
-    });
-}
 
 export async function cmdUse(argv: string[], config: ResolvedConfig): Promise<number> {
     const alias = argv.find((a) => !a.startsWith('-'));
@@ -27,15 +19,11 @@ export async function cmdUse(argv: string[], config: ResolvedConfig): Promise<nu
         return 2;
     }
 
-    const vault = vaultFor(config);
-    const blob = await vault.getPassword();
-    const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias] === undefined) {
+    if (!(await setDefaultAlias(alias, config))) {
         process.stderr.write(`sn-credstore use: no such alias "${alias}"\n`);
         return 1;
     }
 
-    await vault.setPassword(serializeKeyStore(normalizeDefaults(store, alias)));
     process.stdout.write(`Default alias is now "${alias}"\n`);
     return 0;
 }
@@ -49,29 +37,16 @@ export async function cmdDelete(argv: string[], config: ResolvedConfig): Promise
         return 2;
     }
 
-    const vault = vaultFor(config);
-
     if (all) {
-        await vault.deletePassword();
+        await deleteAllAliases(config);
         process.stdout.write('Removed all stored credentials.\n');
         return 0;
     }
 
-    const blob = await vault.getPassword();
-    const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias!] === undefined) {
+    if (!(await deleteAlias(alias!, config))) {
         process.stderr.write(`sn-credstore delete: no such alias "${alias}"\n`);
         return 1;
     }
-
-    const next = { ...store };
-    delete next[alias!];
-
-    // Without this the clobber guard refuses the write — a deliberate delete is
-    // indistinguishable from an accidental wipe unless intent is declared.
-    await vault.withRemovalIntent(async () => {
-        await vault.setPassword(serializeKeyStore(normalizeDefaults(next)));
-    });
 
     process.stdout.write(`Removed "${alias}".\n`);
     return 0;
