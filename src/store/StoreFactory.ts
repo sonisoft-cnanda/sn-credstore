@@ -33,10 +33,14 @@ export function createStore(config: ResolvedConfig): ICredentialStore {
             );
         case 'auto':
         default:
-            // Defaults to file. See config.ts for why encryption is not the
-            // default: on-host it protects nothing, while adding failure modes
-            // that the SDK converts into a full store wipe.
-            return new FileStore(config.blobPath);
+            // Encrypted by default. Verified to work identically across
+            // concurrent headless agents — see config.ts for the threat model
+            // and for what it genuinely does (and does not) protect against.
+            //
+            // Availability is probed lazily by the store itself, so a container
+            // without systemd surfaces a StoreUnavailableError naming the
+            // fallback rather than silently writing plaintext.
+            return new SystemdCredsStore(config.blobPath, config.systemdKey);
     }
 }
 

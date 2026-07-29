@@ -10,6 +10,7 @@ import { cmdImport } from './commands/import.js';
 import { cmdList } from './commands/list.js';
 import { cmdBackend } from './commands/backend.js';
 import { cmdDoctor } from './commands/doctor.js';
+import { cmdMigrate } from './commands/migrate.js';
 import { cmdUse, cmdDelete, cmdShow } from './commands/aliases.js';
 import { isCredentialStoreError } from '../errors.js';
 
@@ -26,11 +27,12 @@ COMMANDS
   import --from keyring [--dry-run]   Migrate credentials out of the OS keyring
   import --stdin                      Read a keystore JSON from stdin
   backend                             Show the active backend and probe others
+  migrate --to <backend>              Convert the store between backends
   doctor [--json]                     Diagnose the store, shim and SDK copies
   preload-path                        Print the absolute path of preload.cjs
 
 ENVIRONMENT
-  SN_CRED_STORE            file (default) | systemd-creds | keyring | auto
+  SN_CRED_STORE            systemd-creds (default) | file | keyring | auto
   SN_CRED_STORE_PATH       Override the blob location
   SN_CRED_STORE_KEY        systemd-creds key: host (default) | tpm2 | host+tpm2
   SN_CRED_STORE_DEBUG      Verbose diagnostics on stderr
@@ -75,6 +77,8 @@ export async function main(argv: string[]): Promise<number> {
                 return await cmdBackend(rest, config);
             case 'doctor':
                 return await cmdDoctor(rest, config);
+            case 'migrate':
+                return await cmdMigrate(rest, config);
             case 'preload-path': {
                 // Derived from argv[1] (bin/sn-credstore.js -> package root)
                 // rather than import.meta.url, because this module is compiled

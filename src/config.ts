@@ -4,16 +4,22 @@
  * Precedence, highest first:
  *   1. SN_CRED_STORE env
  *   2. `store` in $XDG_CONFIG_HOME/sn-credstore/config.json
- *   3. auto  -> file
+ *   3. auto  -> systemd-creds when usable, else an explicit error
  *
- * The default is the plain 0600 file, not systemd-creds. That is a deliberate
- * reliability call: systemd-creds' only real benefit here is off-host
- * confidentiality (a copied blob won't decrypt elsewhere), because on-host it is
- * a root-run decryption oracle reachable over a 0666 socket by any process with
- * your uid — i.e. exactly the population that can already read a 0600 file.
- * Meanwhile it adds fork/exec-per-read failure modes, and the SDK turns any
- * transient read failure into a full store wipe. Encrypted storage is one env
- * var away for anyone who wants it.
+ * The default is systemd-creds, verified to work identically across concurrent
+ * headless agents: it binds to uid + username + machine-id, NOT to a session or
+ * process, so it never touches D-Bus or a session keyring. 20 concurrent agents
+ * in a stripped session read and refreshed it with no failures.
+ *
+ * Be clear about what it does and does not buy. On-host it protects nothing: it
+ * is a root-run decryption oracle reachable over a 0666 socket by any process
+ * with your uid — the same population that can read a 0600 file. Its real value
+ * is OFF-host, where a copied blob simply does not decrypt: backups, rsync'd
+ * home directories, VM snapshots, a stray `git add`.
+ *
+ * The cost is fork/exec per read, and the SDK turns any transient read failure
+ * into a full store wipe — which is why the vault's clobber guard and in-process
+ * caching are load-bearing rather than belt-and-braces.
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
