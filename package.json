@@ -1,0 +1,72 @@
+{
+  "name": "@sonisoft/sn-credstore",
+  "version": "0.1.0",
+  "description": "Headless-safe credential storage for the ServiceNow SDK. Replaces the OS-keyring backend so non-interactive agents can authenticate.",
+  "author": "Chris Nanda",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./register": {
+      "types": "./dist/esm/register.d.ts",
+      "import": "./dist/esm/register.js"
+    },
+    "./preload": {
+      "require": "./preload.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "bin": {
+    "sn-credstore": "./bin/sn-credstore.js",
+    "now-sdk-x": "./bin/now-sdk-wrapped.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "preload.cjs"
+  ],
+  "scripts": {
+    "clean": "rimraf dist tsconfig.tsbuildinfo tsconfig.cjs.tsbuildinfo",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/stamp-cjs.mjs",
+    "build": "npm run clean && npm run build:esm && npm run build:cjs",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit",
+    "test:unit": "node --experimental-vm-modules node_modules/.bin/jest --forceExit --coverage --ci",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
+  },
+  "keywords": [
+    "servicenow",
+    "servicenow-sdk",
+    "credentials",
+    "keyring",
+    "headless",
+    "now-sdk"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sonisoft-cnanda/sn-credstore.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.2.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.0.0",
+    "jest": "^30.2.0",
+    "rimraf": "^6.0.1",
+    "ts-jest": "^29.4.6",
+    "typescript": "^5.5.4"
+  }
+}

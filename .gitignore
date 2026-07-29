@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+*.tsbuildinfo
+*.log
+*.tgz
+.env*
+.bin/
+
+# Never commit a credential store, even a test one.
+*.cred
+credentials.json
