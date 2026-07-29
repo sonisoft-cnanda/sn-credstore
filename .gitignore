@@ -10,3 +10,6 @@ coverage
 # Never commit a credential store, even a test one.
 *.cred
 credentials.json
+
+# CI writes a throwaway store here.
+.tmp-credentials.json

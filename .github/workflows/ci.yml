@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # This package's tests spawn processes that read a credential store. Pin every
+  # job to a throwaway file store so nothing can reach a real one, and so the
+  # absence of systemd on the runner is not mistaken for a failure.
+  SN_CRED_STORE: file
+  SN_CRED_STORE_ALLOW_PLAINTEXT: "1"
+  SN_CRED_STORE_PATH: ${{ github.workspace }}/.tmp-credentials.json
+
+jobs:
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      # The dual build is the fragile part: preload.cjs must stay requireable
+      # from CommonJS and the ESM entry must stay importable. Assert both rather
+      # than trusting that tsc emitted something sensible.
+      - name: Entry points resolve
+        run: |
+          node -e "require('./dist/cjs/index.js'); console.log('cjs ok')"
+          node -e "import('./dist/esm/index.js').then(() => console.log('esm ok'))"
+          node -e "require('./preload.cjs'); console.log('preload ok')"
+
+      # Importing the public API must NOT patch anything. A library that
+      # monkeypatches the SDK's credential storage on import would be a silent,
+      # process-wide behaviour change for every consumer.
+      - name: Public API has no import side effects
+        run: |
+          node -e "
+          import('./dist/esm/index.js').then(() => {
+            if (process.env.NOW_SDK_KEYCHAIN_PATCHED) {
+              console.error('FAIL: importing the public API installed the shim');
+              process.exit(1);
+            }
+            console.log('no import side effects ok');
+          })"
+
+      # Catch a broken "files" list here rather than in production.
+      - name: Package contents
+        run: npm pack --dry-run
