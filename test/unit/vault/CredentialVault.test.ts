@@ -90,6 +90,58 @@ describe('setPassword — the store-wipe guard', () => {
         expect(Object.keys(after).sort()).toEqual(['a', 'b']);
     });
 
+    it('refuses to persist an expires_at in milliseconds', async () => {
+        // types.ts has always documented this hazard but nothing enforced it: ms
+        // makes the SDK's refresh condition permanently false, so the token is never
+        // refreshed and every agent gets silent 401s once it really expires.
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 9999)));
+
+        const vault = makeVault(store);
+        await vault.getPassword();
+
+        const bad = oauth('a', 0);
+        (bad.creds as { expires_at: number }).expires_at = Date.now(); // ms, not seconds
+        await vault.setPassword(blobOf(bad));
+
+        // The good credential is still there, untouched.
+        const after = JSON.parse((await store.read()).blob!) as KeyStore;
+        expect((after.a.creds as { expires_at: number }).expires_at).toBeLessThan(100_000_000_000);
+    });
+
+    it('does not leave a sidecar behind when it refuses a malformed write', async () => {
+        // Refusing must not go through the throw path — setPassword turns a throw
+        // into a pending sidecar, which the next read merges back in, so the
+        // rejected credential would simply arrive later.
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 9999)));
+
+        const vault = makeVault(store);
+        await vault.getPassword();
+
+        const bad = oauth('a', 0);
+        (bad.creds as { expires_at: number }).expires_at = Date.now();
+        await vault.setPassword(blobOf(bad));
+
+        const sidecars = (await readdir(dir)).filter((f) => f.includes('pending'));
+        expect(sidecars).toEqual([]);
+    });
+
+    it('still persists a well-formed credential', async () => {
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 9999)));
+
+        const vault = makeVault(store);
+        await vault.getPassword();
+        // Later expires_at, as a real rotation produces. mergeKeyStores resolves a
+        // same-alias conflict by picking the newer token, so an identical expiry
+        // would legitimately keep the existing one.
+        await vault.setPassword(blobOf(oauth('a', 19_999, 'ROTATED')));
+
+        const after = JSON.parse((await store.read()).blob!) as KeyStore;
+        expect((after.a.creds as { access_token: string }).access_token).toBe('ROTATED');
+    });
+
     it('allows removals when intent is declared', async () => {
         const store = new FileStore(blobPath);
         await store.write(blobOf(oauth('a', 9999), oauth('b', 9999)));

@@ -10,6 +10,7 @@ import { KeyringStore } from '../../store/KeyringStore.js';
 import { findSdkCliCandidates, KNOWN_GOOD_VERSIONS } from '../../shim/locateSdkCli.js';
 import { PATCHED_ENV_VAR } from '../../shim/patch.js';
 import { parseKeyStore } from '../../types.js';
+import { describeProblems, findCredentialProblems } from '../../validate.js';
 import { stat } from 'node:fs/promises';
 import { hasFlag } from '../main.js';
 
@@ -72,6 +73,23 @@ export async function cmdDoctor(argv: string[], config: ResolvedConfig): Promise
                 ? `${store.describe()} — ${aliasCount} alias(es)`
                 : `${store.describe()} — blob present but unparseable`,
         });
+
+        // Reported separately from parseability, because a store can round-trip
+        // perfectly and still hold an expires_at in milliseconds — which surfaces
+        // as silent 401s and looks like anything but a units bug.
+        if (parsed !== null) {
+            const problems = findCredentialProblems(parsed);
+            const blocking = problems.filter((p) => p.severity === 'blocking');
+            checks.push({
+                name: 'credential fields',
+                ok: blocking.length === 0,
+                detail:
+                    problems.length === 0
+                        ? 'all credentials well-formed'
+                        : `${blocking.length} blocking, ${problems.length - blocking.length} warning\n` +
+                          describeProblems(problems),
+            });
+        }
     } catch (err) {
         checks.push({ name: 'active store', ok: false, detail: (err as Error).message });
     }
