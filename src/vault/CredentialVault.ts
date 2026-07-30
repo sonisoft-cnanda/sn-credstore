@@ -20,6 +20,7 @@
  */
 import { ICredentialStore } from '../store/ICredentialStore.js';
 import { KeyStore, parseKeyStore, serializeKeyStore, isInRefreshWindow } from '../types.js';
+import { blockingProblems, describeProblems, findCredentialProblems } from '../validate.js';
 import { mergeKeyStores, detectClobber } from './merge.js';
 import { acquireLock, LockHandle } from '../lock/FileLock.js';
 import { lockPathFor } from '../config.js';
@@ -90,6 +91,19 @@ export class CredentialVault {
             }
 
             this.lastReadStore = parsed;
+
+            // Report but do NOT refuse. The store is already on disk and may be the
+            // user's only copy; making a read fail here would lock them out to fix a
+            // field, and a null return from this method is indistinguishable from
+            // "no credentials" — the exact ambiguity this package exists to remove.
+            // Writes are where corruption is stopped; see persist().
+            const problems = findCredentialProblems(parsed);
+            if (problems.length > 0) {
+                logger.warn(
+                    `credential store has ${problems.length} field problem(s); ` +
+                        `run \`sn-credstore doctor\` for detail:\n${describeProblems(problems)}`,
+                );
+            }
 
             if (this.anyAliasNeedsRefresh(parsed)) {
                 return await this.takeRefreshLease(parsed);
@@ -245,6 +259,20 @@ export class CredentialVault {
             );
         }
 
+        // Refuse to let a malformed credential into the store. Deliberately NOT a
+        // throw: setPassword catches a throw and writes the blob to a pending
+        // sidecar, which the next read merges back in — so throwing here would
+        // persist the very thing being rejected, just later. Same reasoning as the
+        // clobber guard below.
+        const blocking = blockingProblems(findCredentialProblems(incoming));
+        if (blocking.length > 0) {
+            logger.error(
+                `refusing to persist ${blocking.length} malformed credential(s); ` +
+                    `existing credentials were left untouched:\n${describeProblems(blocking)}`,
+            );
+            return;
+        }
+
         // The guard against a write seeded from a failed read.
         const dropped = detectClobber(this.lastReadStore, incoming);
         if (dropped.length > 0 && !this.removalIntent) {
@@ -354,6 +382,19 @@ export class CredentialVault {
                 if (content === null) continue;
                 const pending = parseKeyStore(content);
                 if (pending === null) continue;
+
+                // A sidecar is written when a normal persist failed, so it has not
+                // been through persist()'s validation. Check it here or a malformed
+                // credential re-enters by the back door.
+                const pendingBlocking = blockingProblems(findCredentialProblems(pending));
+                if (pendingBlocking.length > 0) {
+                    logger.error(
+                        `discarding pending update ${entry}; it contains malformed ` +
+                            `credential(s):\n${describeProblems(pendingBlocking)}`,
+                    );
+                    await deleteFileIfExists(path);
+                    continue;
+                }
 
                 const { blob: currentBlob } = await this.store.read();
                 const current = currentBlob === null ? {} : (parseKeyStore(currentBlob) ?? {});

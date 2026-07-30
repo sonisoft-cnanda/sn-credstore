@@ -24,6 +24,15 @@ export {
 } from './types.js';
 
 export {
+    findCredentialProblems,
+    findCredsProblems,
+    blockingProblems,
+    describeProblems,
+    isPlausibleExpiresAtSeconds,
+} from './validate.js';
+export type { CredentialProblem, ProblemSeverity } from './validate.js';
+
+export {
     CredentialStoreError,
     StoreUnavailableError,
     StoreDecryptError,
