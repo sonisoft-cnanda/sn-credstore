@@ -1,8 +1,23 @@
 name: Publish to npm
 
 on:
-  # Manual trigger only — use the "Run workflow" button in GitHub Actions.
-  # Requires the "npm" environment approval (configured in repo settings).
+  # Publish automatically when semantic-release cuts a GitHub release.
+  #
+  # NOTE: this repo has no RELEASE_TOKEN secret, so release.yml currently falls
+  # back to GITHUB_TOKEN — and GitHub suppresses events raised by GITHUB_TOKEN so
+  # a workflow cannot trigger further workflows. Until RELEASE_TOKEN is added,
+  # this trigger will NOT fire and publishing stays manual via workflow_dispatch
+  # below. The trigger is declared now so that adding the secret is the only step
+  # required, rather than a secret plus a workflow change nobody remembers.
+  release:
+    types: [published]
+
+  # Retained for backfill, dry runs, and republishing a specific ref — use the
+  # "Run workflow" button in GitHub Actions.
+  #
+  # Note `inputs` is empty on a release trigger: dry-run is then not `true` so the
+  # real publish runs, and the empty tag falls through to the version-based rule
+  # below (prerelease -> next, otherwise latest).
   workflow_dispatch:
     inputs:
       tag:
@@ -81,15 +96,17 @@ jobs:
 
       - name: Publish (dry run)
         if: inputs.dry-run == true && steps.dist-tag.outputs.skip != 'true'
+        # No NODE_AUTH_TOKEN: this package publishes via a Trusted Publisher
+        # (OIDC), which npm derives from the id-token permission above. npmjs is
+        # phasing token-based publishing out — if publishing breaks, fix the
+        # trusted publisher config on npmjs rather than reintroducing a secret.
         run: npm publish --tag "${{ steps.dist-tag.outputs.tag }}" --dry-run
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish
         if: inputs.dry-run != true && steps.dist-tag.outputs.skip != 'true'
+        # See the dry-run step above: Trusted Publisher (OIDC), no token. The
+        # same OIDC identity is what makes --provenance possible.
         run: npm publish --tag "${{ steps.dist-tag.outputs.tag }}" --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Summary
         if: inputs.dry-run != true && steps.dist-tag.outputs.skip != 'true'

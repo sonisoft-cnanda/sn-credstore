@@ -148,6 +148,35 @@ gating them again would just be a second switch to forget.
 installed before `AuthenticatedCommand.init()` resolves credentials, which is
 before oclif has parsed anything.
 
+## Releasing & Publishing
+
+**Publishing to npm uses a Trusted Publisher (OIDC), not an auth token.** npmjs is
+phasing token-based publishing out, so nothing here should reintroduce one.
+
+- The workflow needs `permissions: id-token: write`. Without it npm cannot mint
+  the OIDC credential, and the failure reads like a missing token — which is the
+  wrong thing to go looking for.
+- The package must be registered as a trusted publisher on npmjs, bound to this
+  repository and workflow file. Renaming `publish.yml` breaks that binding.
+- `--provenance` works off the same OIDC identity.
+- Do NOT add an `NPM_TOKEN`. If publishing fails, fix the trusted publisher
+  configuration on npmjs.
+
+The intended chain: merge to `main` → `release.yml` runs `semantic-release`
+(conventional commits, angular preset), which bumps, tags and cuts a GitHub
+release with `npmPublish: false` → that release fires `publish.yml`.
+
+**This repo is the exception: step two does not fire yet.** `publish.yml`
+declares the `release` trigger, but a release event only reaches other workflows
+when the release was created by something other than the default `GITHUB_TOKEN`
+— GitHub suppresses events raised by it so workflows cannot chain. `release.yml`
+uses `secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN`, and this repo has no
+`RELEASE_TOKEN`, so publishing stays manual until that secret is added. Adding it
+is the only step required; the workflow side is already in place.
+
+Until then, publish with `workflow_dispatch` on `publish.yml`. It skips when the
+version already exists on npm, so re-running is a no-op rather than an error.
+
 ## Conventions
 
 - ES Modules; TypeScript strict; target ES2022
