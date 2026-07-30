@@ -166,16 +166,18 @@ The intended chain: merge to `main` → `release.yml` runs `semantic-release`
 (conventional commits, angular preset), which bumps, tags and cuts a GitHub
 release with `npmPublish: false` → that release fires `publish.yml`.
 
-**This repo is the exception: step two does not fire yet.** `publish.yml`
-declares the `release` trigger, but a release event only reaches other workflows
-when the release was created by something other than the default `GITHUB_TOKEN`
-— GitHub suppresses events raised by it so workflows cannot chain. `release.yml`
-uses `secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN`, and this repo has no
-`RELEASE_TOKEN`, so publishing stays manual until that secret is added. Adding it
-is the only step required; the workflow side is already in place.
+Step two fires **only** because `release.yml` runs semantic-release with
+`RELEASE_TOKEN` rather than the default `GITHUB_TOKEN`. GitHub suppresses events
+raised by `GITHUB_TOKEN` so a workflow cannot trigger further workflows. Since
+`release.yml` falls back (`secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN`),
+removing that secret would leave releases working while publishing silently
+stopped.
 
-Until then, publish with `workflow_dispatch` on `publish.yml`. It skips when the
-version already exists on npm, so re-running is a no-op rather than an error.
+`publish.yml` also accepts `workflow_dispatch` for backfill, dry runs, or
+republishing a ref. It skips when the version already exists on npm, so
+re-running is a no-op rather than an error.
+
+Historical note: `1.0.0` was published by hand, before this chain existed.
 
 ## Conventions
 
