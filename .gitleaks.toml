@@ -1,0 +1,25 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks
+
+title = "gitleaks config"
+
+[extend]
+# Use the default gitleaks rules as a base
+useDefault = true
+
+[allowlist]
+# Build output and vendored content only. Deliberately NO regex exemptions:
+# a full-history scan under the default rules is clean, so there is nothing to
+# suppress — and an allowlist entry added "just in case" is how a real finding
+# later gets hidden.
+#
+# Note this repo holds live OAuth refresh tokens at runtime. The store itself is
+# outside the working tree (XDG state dir) and so is never scanned; that is by
+# design, not an omission.
+paths = [
+    '''node_modules''',
+    '''dist''',
+    '''coverage''',
+    '''\.bin''',
+    '''package-lock\.json''',
+]
