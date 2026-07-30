@@ -158,7 +158,11 @@ phasing token-based publishing out, so nothing here should reintroduce one.
   wrong thing to go looking for.
 - The package must be registered as a trusted publisher on npmjs, bound to this
   repository and workflow file. Renaming `publish.yml` breaks that binding.
-- `--provenance` works off the same OIDC identity.
+- **No `--provenance` here, unlike the sibling repos.** npm rejects a provenance
+  bundle whose source repository is private, and this repo is private:
+  `422 — Unsupported GitHub Actions source repository visibility: "private"`.
+  Auth is unaffected; only the attestation cannot be produced. Add it back if
+  this repo ever becomes public.
 - Do NOT add an `NPM_TOKEN`. If publishing fails, fix the trusted publisher
   configuration on npmjs.
 

@@ -104,9 +104,18 @@ jobs:
 
       - name: Publish
         if: inputs.dry-run != true && steps.dist-tag.outputs.skip != 'true'
-        # See the dry-run step above: Trusted Publisher (OIDC), no token. The
-        # same OIDC identity is what makes --provenance possible.
-        run: npm publish --tag "${{ steps.dist-tag.outputs.tag }}" --provenance
+        # No --provenance, unlike the sibling repos. npm rejects a provenance
+        # bundle whose source repository is private:
+        #
+        #   422 Unprocessable Entity — Error verifying sigstore provenance bundle:
+        #   Unsupported GitHub Actions source repository visibility: "private".
+        #
+        # This repo is private and the others are public, which is the whole of
+        # the difference. Auth is unaffected — the Trusted Publisher (OIDC) flow
+        # works here exactly as it does elsewhere; it is only the attestation that
+        # cannot be produced. If this repo is ever made public, add --provenance
+        # back to match the siblings.
+        run: npm publish --tag "${{ steps.dist-tag.outputs.tag }}"
 
       - name: Summary
         if: inputs.dry-run != true && steps.dist-tag.outputs.skip != 'true'
