@@ -1,14 +1,16 @@
 /**
- * Default backend: a plain 0600 JSON file.
+ * Plaintext backend: a plain 0600 JSON file.
  *
- * Chosen as the default deliberately. Against the actual threat model — many
- * agents on one host, all running as the same user — encrypting at rest buys
- * nothing on-host, because any key the agent can use without interaction is a
- * key every same-uid process can use too. What it does cost is fork/exec per
- * read, and the SDK converts a transient read failure into a full store wipe.
+ * Formerly the default; `SystemdCredsStore` is now the default wherever the
+ * host supports it (systemd >= 256), with this store as the explicit
+ * (SN_CRED_STORE=file) or allowPlaintext-gated fallback.
  *
- * Reliability wins here. `SystemdCredsStore` is one env var away for anyone who
- * wants the off-host property (backups/snapshots/stray copies not decrypting).
+ * Its honest defense: against the actual threat model — many agents on one
+ * host, all running as the same user — encrypting at rest buys nothing
+ * on-host, because any key the agent can use without interaction is a key
+ * every same-uid process can use too. What encryption does buy is the OFF-host
+ * property (backups/snapshots/stray copies not decrypting), which this store
+ * gives up in exchange for zero fork/exec per read.
  */
 import { ICredentialStore, StoreReadResult } from './ICredentialStore.js';
 import {

@@ -9,17 +9,25 @@
 import { ICredentialStore } from './ICredentialStore.js';
 import { FileStore } from './FileStore.js';
 import { SystemdCredsStore } from './SystemdCredsStore.js';
+import { detectSystemdUserCredsSupport, SystemdUserCredsSupport, MIN_SYSTEMD_VERSION } from './systemdSupport.js';
 import { ResolvedConfig } from '../config.js';
 import { PlaintextNotPermittedError } from '../errors.js';
+import { logger } from '../logger.js';
 
 /**
  * Build the configured store.
  *
  * Synchronous by design — it is called from the module-load path of the shim,
  * where an await would force every consumer's entry point to become async.
- * Availability is therefore only probed lazily, by the store itself.
+ * In auto mode the systemd-creds precondition is probed synchronously (a stat,
+ * plus one subprocess only on the unhealthy path); an unsupported host either
+ * falls back to FileStore (when allowPlaintext is set) or throws — never a
+ * silent downgrade.
  */
-export function createStore(config: ResolvedConfig): ICredentialStore {
+export function createStore(
+    config: ResolvedConfig,
+    opts: { systemdSupport?: SystemdUserCredsSupport } = {},
+): ICredentialStore {
     switch (config.store) {
         case 'systemd-creds':
             return new SystemdCredsStore(config.blobPath, config.systemdKey);
@@ -32,15 +40,29 @@ export function createStore(config: ResolvedConfig): ICredentialStore {
                 { storeId: 'keyring' },
             );
         case 'auto':
-        default:
+        default: {
             // Encrypted by default. Verified to work identically across
             // concurrent headless agents — see config.ts for the threat model
             // and for what it genuinely does (and does not) protect against.
-            //
-            // Availability is probed lazily by the store itself, so a container
-            // without systemd surfaces a StoreUnavailableError naming the
-            // fallback rather than silently writing plaintext.
-            return new SystemdCredsStore(config.blobPath, config.systemdKey);
+            const support = opts.systemdSupport ?? detectSystemdUserCredsSupport();
+            if (support.supported) {
+                return new SystemdCredsStore(config.blobPath, config.systemdKey);
+            }
+            if (config.allowPlaintext) {
+                // Explicitly permitted — FileStore still warns once on write.
+                logger.debug(`falling back to file store: ${support.reason}`);
+                return new FileStore(config.blobPath);
+            }
+            throw new PlaintextNotPermittedError(
+                `encrypted credential storage is unavailable: ${support.reason}`,
+                `Upgrade to systemd >= ${MIN_SYSTEMD_VERSION} to use the encrypted default. ` +
+                    `To use the unencrypted 0600 file store instead, either set ` +
+                    `SN_CRED_STORE_ALLOW_PLAINTEXT=1 (or "allowPlaintext": true in ` +
+                    `~/.config/sn-credstore/config.json) to allow automatic fallback, ` +
+                    `or select it explicitly with SN_CRED_STORE=file.`,
+                { storeId: 'systemd-creds' },
+            );
+        }
     }
 }
 

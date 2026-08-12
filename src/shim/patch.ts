@@ -44,7 +44,7 @@ const SHIM_SYMBOL = Symbol.for('@sonisoft/sn-credstore.patched');
 /** Set so downstream tools can assert the preload actually ran. */
 export const PATCHED_ENV_VAR = 'NOW_SDK_KEYCHAIN_PATCHED';
 
-interface KeyChainLike {
+export interface KeyChainLike {
     prototype: {
         getPassword?: () => Promise<string | null>;
         setPassword?: (password: string) => Promise<void>;
@@ -71,7 +71,7 @@ function getVault(config: ResolvedConfig): CredentialVault {
     return vaultSingleton;
 }
 
-function assertPatchable(keychainPath: string, exported: KeyChainLike): void {
+export function assertPatchable(keychainPath: string, exported: KeyChainLike): void {
     const version = versionForKeychainPath(keychainPath);
 
     if (version !== null && !KNOWN_GOOD_VERSIONS.has(version)) {
@@ -129,6 +129,12 @@ export function installKeyChainShim(overrides: Partial<ResolvedConfig> = {}): Sh
         logger.debug('SN_CRED_STORE_DISABLE is set — leaving the OS keyring in place');
         return { patchedFiles: [], uninstall: () => {} };
     }
+
+    // Construct the vault (and thus the store) now, not on first use: backend
+    // selection can refuse (PlaintextNotPermittedError on hosts that cannot run
+    // systemd-creds --user), and that must fail loudly at install time rather
+    // than inside setPassword, whose upstream call site has no try/catch.
+    getVault(config);
 
     const patchedFiles: string[] = [];
 
