@@ -1,5 +1,5 @@
 /**
- * Opt-in backend: the blob encrypted with `systemd-creds --user`.
+ * Default backend (on systemd >= 256): the blob encrypted with `systemd-creds --user`.
  *
  * What this actually protects against — stated honestly, because the name
  * oversells it. `--user` binds uid + username + machine-id and encrypts with a
@@ -18,8 +18,8 @@
  * permanently undecryptable. Treat the store as a cache, not a system of record.
  */
 import { execFile } from 'node:child_process';
-import { access, constants } from 'node:fs/promises';
 import { ICredentialStore, StoreReadResult } from './ICredentialStore.js';
+import { detectSystemdUserCredsSupport } from './systemdSupport.js';
 import {
     readFileVersioned,
     writeFileAtomic,
@@ -31,7 +31,6 @@ import { sanitizeProcessError } from '../redact.js';
 import { SYSTEMD_CRED_NAME } from '../config.js';
 import { logger } from '../logger.js';
 
-const VARLINK_SOCKET = '/run/systemd/io.systemd.Credentials';
 const EXEC_TIMEOUT_MS = 10_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -62,20 +61,9 @@ export class SystemdCredsStore implements ICredentialStore {
     ) {}
 
     async isAvailable(): Promise<boolean> {
-        // The socket is what makes --user work for non-root, and unlike the host
-        // key file it is actually stat-able by us. Checking for the binary alone
-        // would pass inside a container that has systemd installed but not running.
-        try {
-            await access(VARLINK_SOCKET, constants.F_OK);
-        } catch {
-            if (process.getuid?.() !== 0) return false;
-        }
-        try {
-            await this.run(['--version'], undefined);
-            return true;
-        } catch {
-            return false;
-        }
+        // Version-aware, not just binary-present: on systemd < 256 the binary
+        // exists and --version exits 0, but --user itself is unrecognized.
+        return detectSystemdUserCredsSupport().supported;
     }
 
     async read(): Promise<StoreReadResult> {
@@ -101,6 +89,16 @@ export class SystemdCredsStore implements ICredentialStore {
                 envelope.ciphertext,
             );
         } catch (err) {
+            // A binding mismatch and an unsupported host produce the same
+            // opaque failure — distinguish them, or the remediation lies.
+            const support = detectSystemdUserCredsSupport();
+            if (!support.supported) {
+                throw new StoreUnavailableError(
+                    `systemd-creds decrypt failed: ${support.reason}`,
+                    unsupportedHostRemediation(),
+                    { storeId: this.id, cause: err },
+                );
+            }
             throw new StoreDecryptError(
                 `failed to decrypt ${this.blobPath}: ${(err as Error).message}`,
                 this.explainBindingMismatch(envelope),
@@ -135,10 +133,19 @@ export class SystemdCredsStore implements ICredentialStore {
                 blob,
             );
         } catch (err) {
+            const support = detectSystemdUserCredsSupport();
+            if (!support.supported) {
+                throw new StoreUnavailableError(
+                    `systemd-creds encrypt failed: ${support.reason}`,
+                    unsupportedHostRemediation(),
+                    { storeId: this.id, cause: err },
+                );
+            }
+            // Host supports --user, so this is a genuine transient failure —
+            // the probe command below is valid here.
             throw new StoreUnavailableError(
                 `systemd-creds encrypt failed: ${(err as Error).message}`,
-                `Check that systemd-creds works: echo test | systemd-creds encrypt --user --name=probe - -\n` +
-                    `In a container without systemd, use SN_CRED_STORE=file SN_CRED_STORE_ALLOW_PLAINTEXT=1.`,
+                `Check that systemd-creds works: echo test | systemd-creds encrypt --user --name=probe - -`,
                 { storeId: this.id, cause: err },
             );
         }
@@ -213,6 +220,14 @@ export class SystemdCredsStore implements ICredentialStore {
             }
         });
     }
+}
+
+function unsupportedHostRemediation(): string {
+    return (
+        `This host cannot use user-scoped systemd credentials. Upgrade to systemd >= 256, ` +
+        `or use the file backend: SN_CRED_STORE=file ` +
+        `(set SN_CRED_STORE_ALLOW_PLAINTEXT=1 to let auto mode fall back to it).`
+    );
 }
 
 async function readMachineId(): Promise<string | null> {

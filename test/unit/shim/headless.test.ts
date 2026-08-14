@@ -158,7 +158,11 @@ describe('headless session', () => {
             const versionOf = (out: string): string | undefined =>
                 out.split('\n').map((l) => l.trim()).find((l) => /^\d+\.\d+\.\d+/.test(l));
 
-            const env = headlessEnv();
+            // Pin the file backend: since backend selection became eager, the
+            // wrapper refuses at boot on hosts without systemd >= 256 unless a
+            // usable store is configured — and this test is about version
+            // reporting, not backend selection.
+            const env = headlessEnv({ SN_CRED_STORE: 'file', SN_CRED_STORE_PATH: blobPath });
             const stock = versionOf(await runHeadless('now-sdk', ['--version'], env));
             const wrapped = versionOf(await runHeadless(process.execPath, [wrapper, '--version'], env));
 

@@ -43,7 +43,7 @@ export const KEYCHAIN_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]k
  * bodies wholesale, so an unreviewed version could change semantics under us
  * without any signal. Better to refuse and be told than to silently mispatch.
  */
-export const KNOWN_GOOD_VERSIONS = new Set(['4.9.0', '4.9.2']);
+export const KNOWN_GOOD_VERSIONS = new Set(['4.9.0', '4.9.2', '4.10.1']);
 
 export interface SdkCliCandidate {
     keychainPath: string;

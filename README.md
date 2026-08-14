@@ -193,14 +193,20 @@ default.
 | `SN_CRED_STORE_KEY` | `host` | systemd-creds key: `host`, `tpm2`, `host+tpm2` |
 | `SN_CRED_STORE_ENABLE` | _(unset)_ | Opt in from `nex` / the MCP server |
 | `SN_CRED_STORE_DISABLE` | _(unset)_ | Hard off switch; wins over everything |
-| `SN_CRED_STORE_ALLOW_PLAINTEXT` | _(unset)_ | Permit the unencrypted file backend |
+| `SN_CRED_STORE_ALLOW_PLAINTEXT` | _(unset)_ | Let `auto` fall back to the unencrypted file backend when `systemd-creds` is unusable |
 | `SN_CRED_STORE_LOCK_TIMEOUT_MS` | `20000` | Write-lock timeout |
 | `SN_CRED_STORE_DEBUG` | _(unset)_ | Verbose diagnostics on stderr |
 
 ### Backends
 
 **`systemd-creds` (default).** Encrypts with `systemd-creds --user`, pinned to
-`--with-key=host`.
+`--with-key=host`. **Requires systemd >= 256** — both `--user` and the
+`/run/systemd/io.systemd.Credentials` socket it relies on arrived in that
+release, so on older hosts (e.g. Ubuntu 24.04 / current WSL images ship
+systemd 255) the binary exists but every encrypt/decrypt fails. On such hosts
+`auto` refuses with an error naming the version, unless
+`SN_CRED_STORE_ALLOW_PLAINTEXT=1` (or `"allowPlaintext": true` in
+`config.json`) permits falling back to the `file` backend.
 
 Be clear about what this buys, because it is easy to overestimate. **On-host it
 protects nothing**: `/run/systemd/io.systemd.Credentials` is mode `0666` and
@@ -297,9 +303,11 @@ SN_CRED_STORE_DEBUG=1 <cmd>  # verbose, on stderr
 not active for that process. Check `NOW_SDK_KEYCHAIN_PATCHED=1`, and that you
 passed `--cred-store` / set `SN_CRED_STORE_ENABLE=1`.
 
-**"the systemd-creds backend is not usable on this host".** No
-`/run/systemd/io.systemd.Credentials` — typically a container. Use
-`SN_CRED_STORE=file SN_CRED_STORE_ALLOW_PLAINTEXT=1`.
+**"encrypted credential storage is unavailable".** Either systemd is older
+than 256 (`systemd-creds --user` does not exist there — Ubuntu 24.04 / WSL
+ships 255) or `/run/systemd/io.systemd.Credentials` is missing (typically a
+container). Set `SN_CRED_STORE_ALLOW_PLAINTEXT=1` to let `auto` fall back to
+the file backend, or select it outright: `SN_CRED_STORE=file`.
 
 **Decryption fails after a machine change.** Expected: blobs are bound to
 uid + username + machine-id. Re-import from the keyring, or re-authenticate.

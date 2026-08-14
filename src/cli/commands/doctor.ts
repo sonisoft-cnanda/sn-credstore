@@ -6,6 +6,7 @@
  */
 import { ResolvedConfig, SYSTEMD_CRED_NAME } from '../../config.js';
 import { createStore, probeAll } from '../../store/StoreFactory.js';
+import { detectSystemdUserCredsSupport } from '../../store/systemdSupport.js';
 import { KeyringStore } from '../../store/KeyringStore.js';
 import { findSdkCliCandidates, KNOWN_GOOD_VERSIONS } from '../../shim/locateSdkCli.js';
 import { PATCHED_ENV_VAR } from '../../shim/patch.js';
@@ -13,6 +14,7 @@ import { parseKeyStore } from '../../types.js';
 import { describeProblems, findCredentialProblems } from '../../validate.js';
 import { stat } from 'node:fs/promises';
 import { hasFlag } from '../main.js';
+import { isCredentialStoreError } from '../../errors.js';
 
 interface Check {
     name: string;
@@ -57,11 +59,25 @@ export async function cmdDoctor(argv: string[], config: ResolvedConfig): Promise
         });
     }
 
+    // Informational: whether this host can run `systemd-creds --user` at all.
+    // A deliberate SN_CRED_STORE=file user will see a FAIL row here but the
+    // exit code is still decided by the round trip below.
+    const support = detectSystemdUserCredsSupport();
+    checks.push({
+        name: 'systemd user-creds',
+        ok: support.supported,
+        detail: support.supported
+            ? `available${support.systemdVersion !== undefined && support.systemdVersion !== null ? ` (systemd ${support.systemdVersion})` : ''}`
+            : (support.reason ?? 'unavailable'),
+    });
+
     // Active store round trip — the check that decides the exit code.
-    const store = createStore(config);
     let roundTrip = false;
     let aliasCount = 0;
     try {
+        // Inside the try: in auto mode createStore itself refuses on hosts
+        // where systemd-creds is unusable and plaintext was not permitted.
+        const store = createStore(config);
         const { blob } = await store.read();
         const parsed = blob === null ? {} : parseKeyStore(blob);
         roundTrip = parsed !== null;
@@ -91,7 +107,10 @@ export async function cmdDoctor(argv: string[], config: ResolvedConfig): Promise
             });
         }
     } catch (err) {
-        checks.push({ name: 'active store', ok: false, detail: (err as Error).message });
+        const detail = isCredentialStoreError(err)
+            ? `${err.message}\n        Remediation: ${err.remediation}`
+            : (err as Error).message;
+        checks.push({ name: 'active store', ok: false, detail });
     }
 
     // File mode. 0600 is the only thing protecting a plaintext store.

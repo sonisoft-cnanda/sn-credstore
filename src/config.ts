@@ -4,7 +4,8 @@
  * Precedence, highest first:
  *   1. SN_CRED_STORE env
  *   2. `store` in $XDG_CONFIG_HOME/sn-credstore/config.json
- *   3. auto  -> systemd-creds when usable, else an explicit error
+ *   3. auto  -> systemd-creds when usable (systemd >= 256), else FileStore if
+ *      allowPlaintext is set, else an explicit error
  *
  * The default is systemd-creds, verified to work identically across concurrent
  * headless agents: it binds to uid + username + machine-id, NOT to a session or

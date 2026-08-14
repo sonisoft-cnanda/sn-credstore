@@ -35,6 +35,9 @@ ENVIRONMENT
   SN_CRED_STORE            systemd-creds (default) | file | keyring | auto
   SN_CRED_STORE_PATH       Override the blob location
   SN_CRED_STORE_KEY        systemd-creds key: host (default) | tpm2 | host+tpm2
+  SN_CRED_STORE_ALLOW_PLAINTEXT
+                           Permit auto mode to fall back to the unencrypted
+                           file store when systemd-creds is unusable
   SN_CRED_STORE_DEBUG      Verbose diagnostics on stderr
   SN_CRED_STORE_DISABLE    Disable the shim entirely (falls back to the keyring)
 `;
