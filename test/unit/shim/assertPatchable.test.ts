@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertPatchable, KeyChainLike } from '../../../src/shim/patch.js';
+import { KNOWN_GOOD_VERSIONS } from '../../../src/shim/locateSdkCli.js';
 import { ShimPreconditionError, isCredentialStoreError } from '../../../src/errors.js';
 
 let dir: string;
@@ -37,12 +38,16 @@ afterAll(async () => {
 });
 
 describe('assertPatchable version gate', () => {
-    it.each(['4.9.0', '4.9.2', '4.10.1'])('accepts verified version %s', async (version) => {
+    it('contains exactly the reviewed versions', () => {
+        expect([...KNOWN_GOOD_VERSIONS]).toEqual(['4.9.0', '4.9.2', '4.10.1', '4.11.0', '4.11.2']);
+    });
+
+    it.each([...KNOWN_GOOD_VERSIONS])('accepts verified version %s', async (version) => {
         const path = await keychainPathForVersion(version);
         expect(() => assertPatchable(path, goodKeyChain())).not.toThrow();
     });
 
-    it.each(['4.8.0', '5.0.0'])('refuses unverified version %s', async (version) => {
+    it.each(['4.8.0', '4.11.1', '4.12.0', '5.0.0'])('refuses unverified version %s', async (version) => {
         const path = await keychainPathForVersion(version);
         let thrown: unknown;
         try {

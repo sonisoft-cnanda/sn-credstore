@@ -148,7 +148,9 @@ export async function cmdDoctor(argv: string[], config: ResolvedConfig): Promise
     }
 
     if (json) {
-        process.stdout.write(`${JSON.stringify({ checks, ok: roundTrip }, null, 2)}\n`);
+        process.stdout.write(
+            `${JSON.stringify({ config: { store: config.store, blobPath: config.blobPath }, checks, ok: roundTrip }, null, 2)}\n`,
+        );
     } else {
         for (const c of checks) {
             process.stdout.write(`${c.ok ? '  ok  ' : ' FAIL '} ${c.name.padEnd(24)} ${c.detail}\n`);

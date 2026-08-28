@@ -111,6 +111,19 @@ afterAll(async () => {
 });
 
 describe('headless session', () => {
+    it('reports the run-owned store path before any mutation-capable command', async () => {
+        const out = await runHeadless(
+            process.execPath,
+            [join(pkgRoot, 'bin', 'sn-credstore.js'), 'doctor', '--json'],
+            headlessEnv({ SN_CRED_STORE: 'file', SN_CRED_STORE_PATH: blobPath }),
+        );
+        const jsonStart = out.indexOf('{');
+        const result = JSON.parse(out.slice(jsonStart, out.lastIndexOf('}') + 1)) as {
+            config: { store: string; blobPath: string };
+        };
+        expect(result.config).toEqual({ store: 'file', blobPath });
+    });
+
     it('reads the store with no D-Bus, no XDG_RUNTIME_DIR and no DISPLAY', async () => {
         const out = await runHeadless(
             process.execPath,
@@ -135,14 +148,22 @@ describe('headless session', () => {
     (hasNowSdk ? it : it.skip)(
         'the wrapper reads the store where stock now-sdk finds nothing',
         async () => {
-            const env = headlessEnv({ SN_CRED_STORE: 'file', SN_CRED_STORE_PATH: blobPath });
+            const sdkHomes = process.env.SN_CRED_STORE_TEST_SDK_HOMES?.split(':').filter(Boolean) ?? [];
+            const candidates = sdkHomes.length === 0 ? [null] : sdkHomes;
+            for (const sdkHome of candidates) {
+                const env = headlessEnv({
+                    SN_CRED_STORE: 'file',
+                    SN_CRED_STORE_PATH: blobPath,
+                    ...(sdkHome === null ? {} : { SN_SDK_HOME: sdkHome }),
+                });
+                const stock = sdkHome === null
+                    ? await runHeadless('now-sdk', ['auth', '--list'], env)
+                    : await runHeadless(process.execPath, [join(sdkHome, 'bin', 'index.js'), 'auth', '--list'], env);
+                const wrapped = await runHeadless(process.execPath, [wrapper, 'auth', '--list'], env);
 
-            const stock = await runHeadless('now-sdk', ['auth', '--list'], env);
-            const wrapped = await runHeadless(process.execPath, [wrapper, 'auth', '--list'], env);
-
-            // The whole point, in one assertion pair.
-            expect(stock).not.toContain('headlessfixture');
-            expect(wrapped).toContain('headlessfixture');
+                expect(stock).not.toContain('headlessfixture');
+                expect(wrapped).toContain('headlessfixture');
+            }
         },
         90_000,
     );

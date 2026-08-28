@@ -6,6 +6,7 @@ coverage
 *.tgz
 .env*
 .bin/
+.fixtures/
 
 # Never commit a credential store, even a test one.
 *.cred
