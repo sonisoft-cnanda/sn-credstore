@@ -116,6 +116,15 @@ function patchPrototype(keychainPath: string, moduleExports: unknown, config: Re
     return true;
 }
 
+/** Patch one explicitly loaded module for real-package compatibility tests. */
+export function patchKeyChainModule(
+    keychainPath: string,
+    moduleExports: unknown,
+    config: ResolvedConfig,
+): boolean {
+    return patchPrototype(keychainPath, moduleExports, config);
+}
+
 /**
  * Install the shim.
  *
