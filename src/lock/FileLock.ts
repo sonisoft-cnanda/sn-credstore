@@ -11,7 +11,7 @@
  * we must handle stale locks ourselves rather than getting kernel-on-death
  * release for free. That is what bootId + pid liveness below is for.
  */
-import { open, readFile, unlink } from 'node:fs/promises';
+import { open, readFile, unlink, stat } from 'node:fs/promises';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { LockTimeoutError } from '../errors.js';
@@ -28,7 +28,7 @@ interface LockPayload {
     op: string;
 }
 
-/** Steal any lock older than this, on the assumption its holder died badly. */
+/** Grace period for incomplete locks and locks from an unidentifiable host. */
 const DEFAULT_MAX_AGE_MS = 60_000;
 const BACKOFF_BASE_MS = 25;
 const BACKOFF_CAP_MS = 500;
@@ -101,7 +101,14 @@ function installExitHandlers(): void {
 
 async function readLock(path: string): Promise<LockPayload | null> {
     try {
-        return JSON.parse(await readFile(path, 'utf8')) as LockPayload;
+        const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+        if (!value || typeof value !== 'object') return null;
+        const payload = value as Partial<LockPayload>;
+        if (!Number.isInteger(payload.pid) || (payload.pid ?? 0) <= 0 ||
+            typeof payload.hostname !== 'string' || typeof payload.startedAt !== 'number' ||
+            !Number.isFinite(payload.startedAt) ||
+            !(payload.bootId === null || typeof payload.bootId === 'string')) return null;
+        return payload as LockPayload;
     } catch {
         // Unparseable or vanished mid-read. Treat as stale rather than wedging
         // forever on a corrupt lockfile.
@@ -110,7 +117,8 @@ async function readLock(path: string): Promise<LockPayload | null> {
 }
 
 /**
- * A lock is stale when its holder is provably gone, or it is simply too old.
+ * Local locks expire only when their holder is gone. Age is a fallback for
+ * foreign locks whose process identity cannot be checked.
  *
  * The bootId check matters: after a reboot, pid N may well exist again as an
  * unrelated process, and `kill(pid, 0)` would report it alive forever.
@@ -118,14 +126,9 @@ async function readLock(path: string): Promise<LockPayload | null> {
 function isStale(payload: LockPayload | null, maxAgeMs: number): boolean {
     if (payload === null) return true;
 
-    const age = Date.now() - payload.startedAt;
-    if (age > maxAgeMs) {
-        logger.warn(`stealing lock held by pid ${payload.pid} for ${Math.round(age / 1000)}s (op=${payload.op})`);
-        return true;
-    }
-
-    const sameMachine = payload.hostname === hostname() && payload.bootId === BOOT_ID;
-    if (sameMachine && payload.bootId !== null) {
+    const sameHost = payload.hostname === hostname();
+    if (sameHost && payload.bootId !== null && BOOT_ID !== null && payload.bootId !== BOOT_ID) return true;
+    if (sameHost) {
         try {
             process.kill(payload.pid, 0);
             return false; // alive
@@ -138,7 +141,7 @@ function isStale(payload: LockPayload | null, maxAgeMs: number): boolean {
             return false;
         }
     }
-    return false;
+    return Date.now() - payload.startedAt > maxAgeMs;
 }
 
 export async function acquireLock(path: string, options: AcquireOptions = {}): Promise<LockHandle> {
@@ -179,7 +182,12 @@ export async function acquireLock(path: string, options: AcquireOptions = {}): P
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
 
-            if (isStale(await readLock(path), maxAgeMs)) {
+            const payload = await readLock(path);
+            // O_EXCL publishes an empty file before writeFile fills it. A contender
+            // must not mistake that live acquisition window for a stale lock.
+            const incompleteIsOld = payload === null &&
+                await stat(path).then(s => Date.now() - s.mtimeMs > maxAgeMs).catch(() => false);
+            if ((payload !== null && isStale(payload, maxAgeMs)) || incompleteIsOld) {
                 await unlink(path).catch(() => {});
                 continue; // retry immediately after a steal
             }

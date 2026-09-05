@@ -188,9 +188,9 @@ export class CredentialVault {
                 op: 'oauth-refresh',
             });
         } catch (err) {
-            // Better to risk a duplicate refresh than to fail the command.
-            logger.warn(`proceeding without refresh lease: ${(err as Error).message}`);
-            return serializeKeyStore(current);
+            // Returning stale credentials here starts a second refresh with the
+            // same rotating token. A temporary read failure preserves that token.
+            throw err;
         }
 
         try {

@@ -189,6 +189,16 @@ describe('setPassword — the store-wipe guard', () => {
 });
 
 describe('refresh lease — single-flight', () => {
+    it('does not return stale credentials after a lease timeout', async () => {
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 300)));
+        const owner = makeVault(store);
+        await owner.getPassword();
+        try {
+            const contender = new CredentialVault(store, {blobPath, lockTimeoutMs: 1});
+            expect(await contender.getPassword()).toBeNull();
+        } finally { await owner.abandonLease(); }
+    });
     it('does not take a lease when nothing is near expiry', async () => {
         const store = new FileStore(blobPath);
         await store.write(blobOf(oauth('a', 86_400))); // a day out

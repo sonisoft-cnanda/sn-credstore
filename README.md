@@ -352,3 +352,29 @@ for the rules that apply when an automated agent changes this code.
 ## License
 
 MIT
+
+## OAuth refresh verification
+
+Use `now-sdk-x` and `nex --cred-store` with the same backend/path. Plain
+`now-sdk` normally reads the OS keyring; it does not synchronize token rotation
+into this store. An expired access token normally refreshes on use. A revoked or
+expired refresh token needs a new login.
+
+Refresh contenders fail safely when they cannot obtain the lease. Newly created
+incomplete lockfiles are given a grace period; living local owners are not evicted
+merely because the lock is old. Process-death recovery also works without a Linux
+boot ID.
+
+After `npm run build`, the synthetic verification harness exercises the real SDK
+without reading live credentials:
+
+```bash
+SN_SDK_HOME=../now-sdk-ext-core/node_modules/@servicenow/sdk NEX_TEST_BIN=../now-sdk-ext-cli/bin/run.js node scripts/verify-oauth-refresh.mjs
+SN_CRED_STORE_TEST_DOCKER=playwright-server npm test -- --runInBand
+```
+
+The harness creates and verifies its own store, runs 20 refresh clients, checks
+rotation/default/alias invariants, kills a writer before rename, and runs real
+now-sdk-x/nex queries against a local synthetic endpoint. Docker coverage is opt-in;
+the container needs Node and no systemd credential service. No real token belongs
+in these fixtures.
