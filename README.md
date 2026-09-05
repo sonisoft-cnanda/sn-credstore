@@ -47,9 +47,11 @@ Default Credential has not been set
 ## What this does
 
 Patches `KeyChain.prototype` inside `@servicenow/sdk-cli` so credential reads and
-writes go to a store that works without a session. Nothing else about the SDK
-changes: alias resolution, OAuth refresh, `auth --list`, `--use` and `--delete`
-all behave exactly as before. Only the storage location moves.
+writes go to a store that works without a desktop session. It also wraps the
+reviewed SDK OAuth refresh boundary and credential mutations. The SDK still
+selects aliases and negotiates OAuth; the store serializes refresh through durable
+persistence. Read failures propagate with their actual cause instead of becoming
+"no credentials".
 
 It is **opt-in everywhere**. Installing this package changes nothing until you
 ask for it.
@@ -275,23 +277,25 @@ unreachable; any store with real failure modes makes it routine — and it fires
 unattended during OAuth refresh. Making that safe is most of what this package
 does:
 
-- **Clobber guard** — refuses to persist a blob whose alias set is a strict
-  subset of the last good read, unless a delete explicitly asked for it.
+- **Clobber guard** — preserves aliases omitted without explicit deletion intent,
+  while still saving valid additions and updates.
 - **Three-way merge** — diffs incoming against the base that was handed out and
   re-reads current under the lock, so a concurrent refresh of a *different* alias
   is never lost.
-- **Refresh lease** — all agents share one `expires_at`, so they stampede in
-  lockstep inside the same 15-minute window. One process takes the lease and
-  refreshes; the rest re-read and use the fresh token.
+- **Refresh transaction** — the selected credential enters the SDK's 15-minute
+  refresh window, then one process locks, re-reads, refreshes and persists. Peers
+  use the fresh token. Reading an expired *unused* alias reserves no lock.
+  There is no timer that releases a lock while a refresh is still running.
 - **Atomic writes** — temp → `fsync` → `rename` → `fsync` dir. Readers never see
-  a partial blob, so reads take no lock.
+  a partial blob. Ordinary reads take no lock; pending-update recovery does.
 - **`setPassword` never throws** — its call site upstream has no `try`/`catch`.
   On repeated failure it writes a `.pending-*` sidecar and returns; the next read
-  merges and clears it. Silently swallowing would lose a rotated refresh token
-  permanently.
+  merges and clears it under the lock. Versioned sidecars retain the original
+  baseline and explicit removal intent, preserving later default changes.
+  Existing unversioned sidecars remain readable.
 
 **Honest limit:** if ServiceNow rotates refresh tokens on use, two genuinely
-concurrent refreshes still invalidate one token. The lease prevents the double
+concurrent refreshes still invalidate one token. The transaction prevents the double
 refresh and the merge prevents persisting the loser, but neither can help if a
 *non-shimmed* `now-sdk` runs at the same time.
 
@@ -352,3 +356,57 @@ for the rules that apply when an automated agent changes this code.
 ## License
 
 MIT
+
+## OAuth refresh verification
+
+Use `now-sdk-x` and `nex --cred-store` with the same backend/path. Plain
+`now-sdk` normally reads the OS keyring; it does not synchronize token rotation
+into this store. An expired access token normally refreshes on use. A revoked or
+expired refresh token needs a new login.
+
+Refresh contenders return `LOCK_TIMEOUT` when another operation still owns the
+lock. Normal reads and auth listing do not wait on unrelated token expiry. A
+failed store read never means an empty store, and valid additions are not dropped
+just because their incoming blob omits other aliases.
+
+Lock contenders use a local filesystem [bakery queue](https://lamport.azurewebsites.net/pubs/bakery.pdf) with unique owner tickets.
+Only the winner touches the shared `.lock` path, including stale recovery. A
+complete lock payload is published atomically. New locks identify the machine,
+boot, PID namespace and process start time; live owners are never stolen by age.
+The empty `.lock.queue` directory remains between operations. A legacy empty lock
+gets a one-second grace period; unknown, corrupt nonempty or foreign-owner locks
+fail with a diagnostic rather than risking concurrent refresh.
+
+Use one local filesystem and one host/PID namespace for a store. Shared NFS stores,
+clones with duplicated machine identity, and mixed lock-protocol versions are not
+supported. Stop existing credential clients and upgrade **all** nex, MCP and
+now-sdk-x installations sharing the store before restarting them. A live hung
+owner must finish or be stopped; removing its lock is unsafe. Older lockfiles
+without enough identity information may need inspection with all clients stopped.
+
+The shim also patches the reviewed SDK's `OAuth.refreshAccessToken`: it persists
+rotation while locked, updates the SDK's credential object, and suppresses the
+SDK's redundant later write. This covers lazy credentials and a `getCredentials`
+reference imported before shim installation. Compatibility tests pin the auth
+source and exercise every allowlisted SDK version. The in-process alias lookup
+retains 4096 credential fingerprints; recreate very old lazy credentials if their
+fingerprint has been evicted.
+
+After `npm run build`, the synthetic verification harness exercises the real SDK
+without reading live credentials:
+
+```bash
+SN_SDK_HOME=../now-sdk-ext-core/node_modules/@servicenow/sdk NEX_TEST_BIN=../now-sdk-ext-cli/bin/run.js node scripts/verify-oauth-refresh.mjs
+SN_SDK_HOME=../now-sdk-ext-core/node_modules/@servicenow/sdk node scripts/verify-auth-contention.mjs
+node scripts/verify-lock-recovery.mjs
+SN_CRED_STORE_TEST_DOCKER=playwright-server npm test -- --runInBand
+```
+
+Each harness creates and verifies its own store. They run 20 refresh clients, check
+rotation/default/alias invariants, kill a writer during a partial write, and run real
+now-sdk-x/nex queries against a local synthetic endpoint. A 35-second refresh
+proves there is no premature lease release. Separate crash cases exercise a
+chooser, a published lock, and a held lock with 20 processes and 40 writes each.
+Docker coverage repeats those lock cases on Linux and is opt-in;
+the container needs Node and no systemd credential service. No real token belongs
+in these fixtures.

@@ -15,8 +15,9 @@ failure and reports "Default Credential has not been set", which is
 indistinguishable from having no credentials at all.
 
 This package patches `KeyChain.prototype` so the blob lives somewhere a headless
-process can reach, leaving the SDK's entire auth stack (alias resolution, OAuth
-refresh, `--list`, `--use`, `--delete`) untouched.
+process can reach, preserving the SDK's alias and OAuth protocol implementation. It also wraps
+`OAuth.refreshAccessToken` and explicit credential mutations so refresh remains
+locked through durable persistence.
 
 ## The seam
 
@@ -37,7 +38,13 @@ Two facts, established empirically, shape the whole design:
    patches the wrong one about half the time. Hence the `Module._load` hook.
 
 Patch `KeyChain.prototype` â€” **never** `exports.KeyChain` and never the instance.
-Replacing the export is a no-op once the singleton exists.
+Replacing the class export is a no-op once the singleton exists. OAuth and mutation
+functions are separate reviewed seams: patch their module function properties.
+`getRefreshedCredentials` calls `OAuth.refreshAccessToken` dynamically even when
+an application captured `getCredentials` before shim installation. The wrapper
+persists rotation, updates the passed credential object and returns undefined;
+the SDK then returns that object without a second unlocked write. Keep the
+published-package source hashes and behavior tests in `refresh.test.ts` current.
 
 ## Two axes, kept separate
 
@@ -66,8 +73,8 @@ src/store/KeyringStore.ts         READ-ONLY; lazy @napi-rs/keyring from the SDK 
 src/store/StoreFactory.ts         Selection + probeAll() for doctor
 src/store/atomicFile.ts           temp -> fsync -> rename -> fsync dir
 
-src/lock/FileLock.ts              O_EXCL lockfile, pid/bootId staleness, jittered backoff
-src/vault/CredentialVault.ts      Lease, clobber guard, sidecars, in-process cache
+src/lock/FileLock.ts              Bakery queue, atomic lock publication, owner-aware recovery
+src/vault/CredentialVault.ts      Refresh transactions, protected merges, versioned sidecars
 src/vault/merge.ts                Base-diff changeset, three-way apply, isDefault invariant
 
 src/shim/locateSdkCli.ts          Shared by doctor and the wrapper
@@ -126,7 +133,7 @@ Compounding it: all agents share one `expires_at`, so they don't race randomly â
 they stampede in lockstep inside the same 15-minute window
 (`if (expiresIn > 15 * 60) return`).
 
-The clobber guard, three-way merge, refresh lease, atomic writes and in-process
+The clobber guard, three-way merge, refresh transaction, atomic writes and in-process
 cache are all load-bearing responses to this. They are not belt-and-braces.
 
 ## Consumer wiring

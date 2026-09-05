@@ -1,38 +1,36 @@
-/**
- * The object the SDK's KeyChain methods are rewired to.
- *
- * Three responsibilities, all of them about not losing credentials:
- *
- *  1. Refresh lease (single-flight). All agents share one `expires_at`, so they
- *     do not race randomly — they stampede in lockstep inside the same 15-minute
- *     window. Without arbitration, N agents each call the token endpoint; if
- *     ServiceNow rotates refresh tokens, N-1 of them are invalidated and the SDK
- *     throws demanding an interactive `now-sdk auth --add` — an outage on a
- *     headless box.
- *
- *  2. Clobber protection. The SDK seeds every write from
- *     `(await getParsedCredentials()) ?? {}`, so one failed read followed by any
- *     write silently replaces the whole store with a single alias.
- *
- *  3. setPassword must never throw. Its call site upstream has no try/catch, so
- *     throwing turns a successful token refresh into a crash — after the network
- *     round trip, with the new token already issued and now unrecorded.
- */
-import { ICredentialStore } from '../store/ICredentialStore.js';
-import { KeyStore, parseKeyStore, serializeKeyStore, isInRefreshWindow } from '../types.js';
-import { blockingProblems, describeProblems, findCredentialProblems } from '../validate.js';
-import { mergeKeyStores, detectClobber } from './merge.js';
-import { acquireLock, LockHandle } from '../lock/FileLock.js';
-import { lockPathFor } from '../config.js';
-import { logger } from '../logger.js';
-import { StoreCorruptError } from '../errors.js';
-import { writeFileAtomic, readFileVersioned, deleteFileIfExists } from '../store/atomicFile.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { dirname, basename, join } from 'node:path';
+import { ICredentialStore } from '../store/ICredentialStore.js';
+import { KeyStore, OAuthCred, parseKeyStore, serializeKeyStore, isInRefreshWindow } from '../types.js';
+import { blockingProblems, describeProblems, findCredentialProblems } from '../validate.js';
+import { mergeKeyStores } from './merge.js';
+import { acquireLock } from '../lock/FileLock.js';
+import { lockPathFor } from '../config.js';
+import { logger } from '../logger.js';
+import { StoreCorruptError, StoreUnavailableError } from '../errors.js';
+import { writeFileAtomic, readFileVersioned, deleteFileIfExists } from '../store/atomicFile.js';
 
-/** Give up on a lease this long after taking it, in case the SDK never writes. */
-const LEASE_TIMEOUT_MS = 30_000;
-const WRITE_RETRIES = 3;
+interface Operation {
+    active: boolean;
+    locked: boolean;
+    removal: boolean;
+    base: KeyStore | null;
+    failure?: unknown;
+}
+
+interface PendingUpdate {
+    version: 1;
+    base: KeyStore | null;
+    incoming: KeyStore;
+    allowRemovals: boolean;
+}
+
+type Tokens = Pick<OAuthCred, 'access_token' | 'refresh_token' | 'expires_at' | 'token_type'>;
+const fingerprint = (creds: OAuthCred): string => createHash('sha256')
+    .update(JSON.stringify([creds.instanceUrl, creds.access_token, creds.refresh_token, creds.expires_at, creds.token_type]))
+    .digest('hex');
 
 export interface VaultOptions {
     blobPath: string;
@@ -41,388 +39,221 @@ export interface VaultOptions {
 
 export class CredentialVault {
     private readonly lockPath: string;
-
-    /** Last blob we successfully read, so we can diff the SDK's write against it. */
+    private readonly operations = new AsyncLocalStorage<Operation>();
+    private readonly observed = new Map<string, Set<string>>();
     private lastReadStore: KeyStore | null = null;
 
-    /** Held across a getPassword -> setPassword pair when a refresh is imminent. */
-    private lease: LockHandle | null = null;
-    private leaseTimer: NodeJS.Timeout | null = null;
-
-    /** True only while an explicit delete is in flight, which permits removals. */
-    private removalIntent = false;
-
-    constructor(
-        private readonly store: ICredentialStore,
-        private readonly options: VaultOptions,
-    ) {
+    constructor(private readonly store: ICredentialStore, private readonly options: VaultOptions) {
         this.lockPath = lockPathFor(options.blobPath);
     }
 
-    /**
-     * Mirrors KeyChain.getPassword: returns the raw blob, or null when empty.
-     *
-     * Must not throw — the SDK treats any throw here as "no credentials". But
-     * unlike the SDK we distinguish empty from broken, and say so on stderr.
-     */
+    private operation(): Operation | undefined {
+        const operation = this.operations.getStore();
+        return operation?.active ? operation : undefined;
+    }
+
+    private remember(store: KeyStore): void {
+        for (const [alias, entry] of Object.entries(store)) {
+            if (entry.creds.type !== 'oauth') continue;
+            const key = fingerprint(entry.creds);
+            const aliases = this.observed.get(key) ?? new Set<string>();
+            aliases.add(alias);
+            this.observed.delete(key);
+            this.observed.set(key, aliases);
+        }
+        while (this.observed.size > 4096) this.observed.delete(this.observed.keys().next().value!);
+    }
+
+    private async readStore(): Promise<{ store: KeyStore; blob: string | null; version: string | null }> {
+        const { blob, version } = await this.store.read();
+        if (blob === null) return { store: {}, blob, version };
+        const store = parseKeyStore(blob);
+        if (store === null) {
+            await writeFileAtomic(`${this.options.blobPath}.corrupt.${randomUUID()}`, blob).catch(() => {});
+            throw new StoreCorruptError('Credential store is not a valid keystore.', 'Preserve the store and inspect it with sn-credstore doctor.');
+        }
+        return { store, blob, version };
+    }
+
+    /** Read credentials without arming a speculative refresh lease; null means empty only. */
     async getPassword(): Promise<string | null> {
-        try {
-            await this.absorbPendingSidecars();
-
-            // Lock-free: >95% of calls need no refresh, and atomic-rename writes
-            // mean a reader can never observe a partial blob.
-            const { blob } = await this.store.read();
-            if (blob === null) {
-                logger.debug('credential store is empty');
-                this.lastReadStore = null;
-                return null;
-            }
-
-            const parsed = parseKeyStore(blob);
-            if (parsed === null) {
-                // Returning it would make the SDK's own JSON.parse throw a bare
-                // SyntaxError from deep inside its auth path. Preserve and refuse.
-                await this.quarantineCorruptBlob(blob);
-                logger.error(
-                    `credential store at ${this.options.blobPath} is not a valid keystore; ` +
-                        `a copy was preserved alongside it. Re-import with: sn-credstore import --from keyring`,
-                );
-                return null;
-            }
-
-            this.lastReadStore = parsed;
-
-            // Report but do NOT refuse. The store is already on disk and may be the
-            // user's only copy; making a read fail here would lock them out to fix a
-            // field, and a null return from this method is indistinguishable from
-            // "no credentials" — the exact ambiguity this package exists to remove.
-            // Writes are where corruption is stopped; see persist().
-            const problems = findCredentialProblems(parsed);
-            if (problems.length > 0) {
-                logger.warn(
-                    `credential store has ${problems.length} field problem(s); ` +
-                        `run \`sn-credstore doctor\` for detail:\n${describeProblems(problems)}`,
-                );
-            }
-
-            if (this.anyAliasNeedsRefresh(parsed)) {
-                return await this.takeRefreshLease(parsed);
-            }
-            return blob;
-        } catch (err) {
-            // Never propagate: the SDK would report "Default Credential has not
-            // been set", which is the misleading message we exist to replace.
-            this.reportReadFailure(err);
-            return null;
-        }
+        await this.absorbPendingSidecars();
+        const { store, blob } = await this.readStore();
+        const problems = findCredentialProblems(store);
+        if (problems.length) logger.warn(`credential store has field problems:\n${describeProblems(problems)}`);
+        this.remember(store);
+        this.lastReadStore = blob === null ? null : store;
+        const operation = this.operation();
+        if (operation) operation.base = this.lastReadStore;
+        return blob;
     }
 
-    /**
-     * Mirrors KeyChain.setPassword. MUST NOT THROW — see class docblock.
-     */
-    async setPassword(blob: string): Promise<void> {
+    /** Run a complete mutation under one lock, with a baseline isolated from sibling calls. */
+    async withTransaction<T>(fn: () => Promise<T>, op = 'write', removal = false): Promise<T> {
+        const existing = this.operation();
+        if (existing?.locked) return fn();
+        const lock = await acquireLock(this.lockPath, { timeoutMs: this.options.lockTimeoutMs, op });
+        const operation: Operation = { active: true, locked: true, removal, base: null };
         try {
-            await this.persist(blob);
-        } catch (err) {
-            logger.error(`failed to persist credential store: ${(err as Error).message}`);
-            await this.writePendingSidecar(blob);
+            return await this.operations.run(operation, async () => {
+                await this.absorbPendingSidecars();
+                const result = await fn();
+                if (operation.failure) throw operation.failure;
+                return result;
+            });
         } finally {
-            await this.releaseLease();
+            operation.active = false;
+            await lock.release();
         }
     }
 
-    async deletePassword(): Promise<boolean> {
-        this.removalIntent = true;
+    /** Persist SDK-issued rotation before releasing its lock, then update the SDK's credential object. */
+    async refreshCredentials(creds: OAuthCred, refresh: (current: OAuthCred) => Promise<Tokens | undefined>): Promise<void> {
+        if (!isInRefreshWindow(creds)) return;
+        const aliases = this.observed.get(fingerprint(creds));
+        if (!aliases?.size) {
+            throw new StoreUnavailableError('Cannot associate this refresh with a stored alias.', 'Resolve credentials again through the SDK before refreshing.');
+        }
+        await this.withTransaction(async () => {
+            const { store } = await this.readStore();
+            const candidates = [...aliases].map(alias => store[alias]).filter(entry => entry?.creds.type === 'oauth' && entry.creds.instanceUrl === creds.instanceUrl);
+            const current = candidates[0]?.creds;
+            if (!current || current.type !== 'oauth' || candidates.some(entry => entry && entry.creds.type === 'oauth' && fingerprint(entry.creds) !== fingerprint(current))) {
+                throw new StoreUnavailableError('Stored alias changed or became ambiguous before refresh.', 'Resolve the selected alias again.');
+            }
+            const tokens = await refresh({ ...current });
+            const renewed: OAuthCred = { ...current, ...tokens };
+            if (renewed.expires_at <= Math.floor(Date.now() / 1000)) {
+                throw new StoreUnavailableError('SDK returned expired credentials after refresh.', 'Check instance connectivity and retry.');
+            }
+            if (tokens) {
+                const updated: KeyStore = { ...store };
+                for (const [alias, entry] of Object.entries(store)) {
+                    if (entry.creds.type === 'oauth' && fingerprint(entry.creds) === fingerprint(current)) {
+                        updated[alias] = { ...entry, creds: { ...renewed } };
+                    }
+                }
+                this.operation()!.base = store;
+                await this.setPassword(serializeKeyStore(updated));
+                if (this.operation()!.failure) throw this.operation()!.failure;
+                this.remember(updated);
+            }
+            // The reviewed SDK returns this same object when refreshAccessToken
+            // returns undefined. Suppress its later, unlocked read-modify-write:
+            // both the rotated token and alias metadata are already durable here.
+            Object.assign(creds, renewed);
+        }, 'oauth-refresh');
+    }
+
+    /** Preserve valid SDK updates in an emergency sidecar if normal persistence fails. Never throws. */
+    async setPassword(blob: string): Promise<void> {
+        const incoming = parseKeyStore(blob);
+        const blocking = incoming === null ? [] : blockingProblems(findCredentialProblems(incoming));
+        if (incoming === null || blocking.length > 0) {
+            const error = new StoreCorruptError('Refusing malformed credential update.', 'Inspect the caller and run sn-credstore doctor.');
+            const operation = this.operation();
+            if (operation) operation.failure = error;
+            logger.error(error.message);
+            return;
+        }
         try {
+            await this.persist(incoming);
+        } catch (error: unknown) {
+            try {
+                await this.writePendingSidecar(incoming);
+            } catch {
+                const operation = this.operation();
+                if (operation) operation.failure = new StoreUnavailableError('Credential update and emergency recovery write both failed.', 'Restore writable credential storage before retrying.');
+                logger.error('Could not persist credential update or its emergency sidecar.');
+            }
+            logger.error('Credential store write failed; a pending update is retained when recovery storage is writable.');
+        }
+    }
+
+    /** Delete the complete store under the same lock used by refresh and writes. */
+    async deletePassword(): Promise<boolean> {
+        return this.withTransaction(async () => {
             const removed = await this.store.delete();
             this.lastReadStore = null;
             return removed;
-        } catch (err) {
-            logger.error(`failed to delete credential store: ${(err as Error).message}`);
-            return false;
-        } finally {
-            this.removalIntent = false;
-            await this.releaseLease();
-        }
+        }, 'delete', true);
     }
 
-    /** Let callers (e.g. `sn-credstore delete <alias>`) authorise removals. */
+    /** Authorize deletions only within this asynchronous operation. */
     async withRemovalIntent<T>(fn: () => Promise<T>): Promise<T> {
-        this.removalIntent = true;
-        try {
-            return await fn();
-        } finally {
-            this.removalIntent = false;
-        }
+        const existing = this.operation();
+        const operation: Operation = { active: true, locked: existing?.locked ?? false, removal: true, base: existing?.base ?? this.lastReadStore };
+        try { return await this.operations.run(operation, fn); }
+        finally { operation.active = false; }
     }
 
-    // ---------------------------------------------------------------- internals
+    /** Kept for callers predating operation-scoped locking; reads no longer hold leases. */
+    async abandonLease(): Promise<void> {}
 
-    private anyAliasNeedsRefresh(store: KeyStore): boolean {
-        return Object.values(store).some((entry) => isInRefreshWindow(entry.creds));
-    }
-
-    /**
-     * Single-flight: take the lock, then RE-READ under it.
-     *
-     * The re-read is the whole mechanism. If a peer refreshed while we waited,
-     * the alias is no longer in the window, so we release and return their fresh
-     * blob without making a second token call. Otherwise we keep the lock held
-     * across the SDK's refresh and its setPassword.
-     */
-    private async takeRefreshLease(current: KeyStore): Promise<string> {
-        // Reentrancy. The SDK calls getCredentials more than once per command,
-        // so getPassword can fire again while we still hold the lease from the
-        // previous call. Without this check the process blocks on a lock it
-        // already owns and burns the full 20s timeout before falling through —
-        // observed live as "held by pid <self>, age 20786ms".
-        if (this.lease !== null) {
-            logger.debug('refresh lease already held by this process; reusing it');
-            return serializeKeyStore(current);
-        }
-
-        let lock: LockHandle;
-        try {
-            lock = await acquireLock(this.lockPath, {
-                timeoutMs: this.options.lockTimeoutMs ?? 20_000,
-                op: 'oauth-refresh',
-            });
-        } catch (err) {
-            // Better to risk a duplicate refresh than to fail the command.
-            logger.warn(`proceeding without refresh lease: ${(err as Error).message}`);
-            return serializeKeyStore(current);
-        }
-
-        try {
-            const { blob } = await this.store.read();
-            const reread = blob === null ? null : parseKeyStore(blob);
-
-            if (reread !== null && !this.anyAliasNeedsRefresh(reread)) {
-                logger.debug('another process already refreshed; skipping duplicate refresh');
-                this.lastReadStore = reread;
-                await lock.release();
-                return blob as string;
-            }
-
-            if (reread !== null) {
-                this.lastReadStore = reread;
-            }
-
-            // Hold the lock across the SDK's refresh + setPassword.
-            this.lease = lock;
-            this.leaseTimer = setTimeout(() => {
-                logger.warn('refresh lease expired without a write; releasing');
-                void this.releaseLease();
-            }, LEASE_TIMEOUT_MS);
-            this.leaseTimer.unref?.();
-
-            return serializeKeyStore(this.lastReadStore ?? current);
-        } catch (err) {
-            await lock.release();
-            throw err;
-        }
-    }
-
-    /**
-     * Drop a lease taken by a getPassword that will not be followed by a write.
-     *
-     * getPassword takes the refresh lease when a token is near expiry, on the
-     * assumption that the SDK's refresh + setPassword is about to follow. A
-     * caller that reads and then decides not to write (an alias that turns out
-     * not to exist, say) would otherwise hold it until the 30s bail timer fires,
-     * stalling the next writer for no reason.
-     */
-    async abandonLease(): Promise<void> {
-        await this.releaseLease();
-    }
-
-    private async releaseLease(): Promise<void> {
-        if (this.leaseTimer !== null) {
-            clearTimeout(this.leaseTimer);
-            this.leaseTimer = null;
-        }
-        if (this.lease !== null) {
-            const lock = this.lease;
-            this.lease = null;
-            await lock.release();
-        }
-    }
-
-    /** Merge and write, holding the lock if we do not already hold the lease. */
-    private async persist(blob: string): Promise<void> {
-        const incoming = parseKeyStore(blob);
-        if (incoming === null) {
-            throw new StoreCorruptError(
-                'refusing to persist a blob that is not a valid keystore',
-                'This is a bug in the caller. Report it with SN_CRED_STORE_DEBUG=1 output.',
-                { storeId: this.store.id },
-            );
-        }
-
-        // Refuse to let a malformed credential into the store. Deliberately NOT a
-        // throw: setPassword catches a throw and writes the blob to a pending
-        // sidecar, which the next read merges back in — so throwing here would
-        // persist the very thing being rejected, just later. Same reasoning as the
-        // clobber guard below.
-        const blocking = blockingProblems(findCredentialProblems(incoming));
-        if (blocking.length > 0) {
-            logger.error(
-                `refusing to persist ${blocking.length} malformed credential(s); ` +
-                    `existing credentials were left untouched:\n${describeProblems(blocking)}`,
-            );
-            return;
-        }
-
-        // The guard against a write seeded from a failed read.
-        const dropped = detectClobber(this.lastReadStore, incoming);
-        if (dropped.length > 0 && !this.removalIntent) {
-            logger.error(
-                `refusing to drop ${dropped.length} alias(es) [${dropped.join(', ')}] — ` +
-                    `this write would have removed credentials that were not deleted explicitly. ` +
-                    `Existing credentials were left untouched.`,
-            );
-            // Not a throw: setPassword must never throw. Refusing is recoverable.
-            return;
-        }
-
-        const alreadyHeld = this.lease !== null;
-        const doWrite = async (): Promise<void> => {
-            const { blob: currentBlob, version: currentVersion } = await this.store.read();
-            const current = currentBlob === null ? {} : (parseKeyStore(currentBlob) ?? {});
-            const base = this.lastReadStore ?? current;
-
-            const { merged, protectedAliases } = mergeKeyStores(base, incoming, current, {
-                allowRemovals: this.removalIntent,
-            });
-            if (protectedAliases.length > 0) {
-                logger.warn(`preserved ${protectedAliases.length} alias(es) not present in this write: ${protectedAliases.join(', ')}`);
-            }
-
-            // Compare-and-swap against the version we just read under the lock.
-            // The lock already serialises everything that goes through us, so
-            // this specifically catches writers that DON'T — a bare `now-sdk`
-            // without the preload, or an IDE extension using the keyring path.
-            // Without it, such a writer's update would be silently overwritten.
-            const serialized = serializeKeyStore(merged);
-            await this.writeWithRetry(serialized, currentVersion);
-            this.lastReadStore = merged;
-        };
-
-        if (alreadyHeld) {
-            await doWrite();
-        } else {
-            const lock = await acquireLock(this.lockPath, {
-                timeoutMs: this.options.lockTimeoutMs ?? 20_000,
-                op: 'write',
-            });
-            try {
-                await doWrite();
-            } finally {
-                await lock.release();
-            }
-        }
-    }
-
-    private async writeWithRetry(blob: string, expected?: string | null): Promise<void> {
-        let lastErr: unknown;
-        for (let attempt = 0; attempt < WRITE_RETRIES; attempt++) {
-            try {
-                // Only the first attempt carries the CAS token. A retry means the
-                // earlier write may or may not have landed, so re-asserting a
-                // stale version would fail forever; the lock still serialises us.
-                await this.store.write(blob, attempt === 0 ? expected : undefined);
+    private async persist(incoming: KeyStore): Promise<void> {
+        const base = this.operation()?.base ?? this.lastReadStore;
+        const removal = this.operation()?.removal ?? false;
+        const write = async (): Promise<void> => {
+            for (let attempt = 0; ; attempt++) {
+                const { store: current, version } = await this.readStore();
+                const { merged, protectedAliases } = mergeKeyStores(base ?? current, incoming, current, { allowRemovals: removal });
+                if (protectedAliases.length) logger.warn(`preserved ${protectedAliases.length} aliases absent from this update`);
+                try { await this.store.write(serializeKeyStore(merged), version); }
+                catch (error: unknown) {
+                    if (attempt === 2) throw error;
+                    continue;
+                }
+                this.lastReadStore = merged;
+                const operation = this.operation();
+                if (operation) operation.base = merged;
                 return;
-            } catch (err) {
-                lastErr = err;
-                logger.debug(`write attempt ${attempt + 1}/${WRITE_RETRIES} failed`);
-                await new Promise((r) => setTimeout(r, 50 * 2 ** attempt));
             }
-        }
-        throw lastErr;
+        };
+        if (this.operation()?.locked) await write();
+        else await this.withTransaction(write);
     }
 
-    /**
-     * Last resort when every write attempt failed.
-     *
-     * Silently swallowing would permanently lose a rotated refresh token — the
-     * old one is already invalid server-side, so the credential is simply dead.
-     * A sidecar keeps it recoverable and the next read folds it back in.
-     */
-    private async writePendingSidecar(blob: string): Promise<void> {
-        try {
-            const path = `${this.options.blobPath}.pending-${Date.now()}`;
-            await writeFileAtomic(path, blob);
-            logger.error(
-                `credential update could not be saved to the store; it was written to ${path} ` +
-                    `and will be merged on the next successful read. Do not delete that file.`,
-            );
-        } catch (err) {
-            logger.error(`could not write emergency sidecar either: ${(err as Error).message}`);
-        }
+    private async writePendingSidecar(incoming: KeyStore): Promise<void> {
+        const path = `${this.options.blobPath}.pending-${Date.now()}-${randomUUID()}`;
+        const pending: PendingUpdate = { version: 1, incoming, base: this.operation()?.base ?? this.lastReadStore,
+            allowRemovals: this.operation()?.removal ?? false };
+        await writeFileAtomic(path, JSON.stringify(pending));
+        logger.error(`Credential update preserved in ${path}; the next successful read will recover it.`);
     }
 
-    /** Fold any `.pending-*` sidecars back into the store, then remove them. */
     private async absorbPendingSidecars(): Promise<void> {
         const dir = dirname(this.options.blobPath);
         const prefix = `${basename(this.options.blobPath)}.pending-`;
-
-        let entries: string[];
-        try {
-            entries = (await readdir(dir)).filter((f) => f.startsWith(prefix));
-        } catch {
+        const entries = await readdir(dir).then(names => names.filter(name => name.startsWith(prefix)).sort(), error => {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+            throw error;
+        });
+        if (!entries.length) return;
+        if (!this.operation()?.locked) {
+            await this.withTransaction(async () => {}, 'recover');
             return;
         }
-        if (entries.length === 0) return;
-
-        logger.warn(`recovering ${entries.length} pending credential update(s)`);
-        for (const entry of entries.sort()) {
+        for (const entry of entries) {
             const path = join(dir, entry);
-            try {
-                const { content } = await readFileVersioned(path);
-                if (content === null) continue;
-                const pending = parseKeyStore(content);
-                if (pending === null) continue;
-
-                // A sidecar is written when a normal persist failed, so it has not
-                // been through persist()'s validation. Check it here or a malformed
-                // credential re-enters by the back door.
-                const pendingBlocking = blockingProblems(findCredentialProblems(pending));
-                if (pendingBlocking.length > 0) {
-                    logger.error(
-                        `discarding pending update ${entry}; it contains malformed ` +
-                            `credential(s):\n${describeProblems(pendingBlocking)}`,
-                    );
-                    await deleteFileIfExists(path);
-                    continue;
-                }
-
-                const { blob: currentBlob } = await this.store.read();
-                const current = currentBlob === null ? {} : (parseKeyStore(currentBlob) ?? {});
-                const { merged } = mergeKeyStores(current, pending, current, { allowRemovals: false });
-                await this.store.write(serializeKeyStore(merged));
-                await deleteFileIfExists(path);
-                logger.info(`recovered pending credential update from ${entry}`);
-            } catch (err) {
-                logger.warn(`could not recover ${entry}: ${(err as Error).message}`);
+            const { content } = await readFileVersioned(path);
+            if (content === null) continue;
+            let value: unknown;
+            try { value = JSON.parse(content); }
+            catch { throw new StoreCorruptError('Malformed pending credential update.', 'Inspect pending updates with the credential clients stopped.'); }
+            const envelope = value as Partial<PendingUpdate> | null;
+            const wrapped = envelope?.version === 1 && envelope.incoming !== undefined;
+            const pending = wrapped ? parseKeyStore(JSON.stringify(envelope.incoming)) : parseKeyStore(content);
+            const base = wrapped && envelope.base !== null ? parseKeyStore(JSON.stringify(envelope.base)) : null;
+            if (pending === null || blockingProblems(findCredentialProblems(pending)).length > 0) {
+                throw new StoreCorruptError('Malformed pending credential update.', 'Inspect pending updates with the credential clients stopped.');
             }
-        }
-    }
-
-    private async quarantineCorruptBlob(blob: string): Promise<void> {
-        try {
-            await writeFileAtomic(`${this.options.blobPath}.corrupt.${Date.now()}`, blob);
-        } catch {
-            /* best effort */
-        }
-    }
-
-    /** Say what actually went wrong, with remediation — the SDK never does. */
-    private reportReadFailure(err: unknown): void {
-        const anyErr = err as { remediation?: string; message?: string };
-        if (typeof anyErr?.remediation === 'string') {
-            logger.error(`${anyErr.message}\n  Remediation: ${anyErr.remediation}`);
-        } else {
-            logger.error(`could not read credential store: ${(err as Error).message}`);
+            const { store: current, version } = await this.readStore();
+            if (wrapped && envelope.base !== null && base === null) {
+                throw new StoreCorruptError('Malformed pending credential baseline.', 'Inspect pending updates with the credential clients stopped.');
+            }
+            const { merged } = mergeKeyStores(base ?? current, pending, current, { allowRemovals: wrapped && envelope.allowRemovals === true });
+            await this.store.write(serializeKeyStore(merged), version);
+            await deleteFileIfExists(path);
         }
     }
 }

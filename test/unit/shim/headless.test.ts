@@ -4,8 +4,44 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { sanitizeProcessError } from '../../../src/redact.js';
 
 const execFileAsync = promisify(execFile);
+
+const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
+(dockerContainer ? it : it.skip)('file backend works in Docker and encrypted selection refuses downgrade', async () => {
+    const run = async (args: string[]): Promise<string> => {
+        try {
+            return (await execFileAsync('docker', args, {timeout: 30_000})).stdout;
+        } catch (error: unknown) { throw new Error(JSON.stringify(sanitizeProcessError(error))); }
+    };
+    const directory = (await run(['exec', dockerContainer!, 'mktemp', '-d', '/tmp/sncs-headless-XXXXXX'])).trim();
+    if (!directory.startsWith('/tmp/sncs-headless-')) throw new Error('Unexpected Docker sandbox');
+    try {
+        await run(['cp', resolve('dist'), dockerContainer + ':' + directory + '/dist']);
+        await run(['cp', resolve('package.json'), dockerContainer + ':' + directory + '/package.json']);
+        const script = `
+            import {listAliases} from '${directory}/dist/esm/index.js';
+            import {createStore} from '${directory}/dist/esm/store/StoreFactory.js';
+            import {loadConfig} from '${directory}/dist/esm/config.js';
+            const config=loadConfig();
+            if((await listAliases(config)).path!==process.env.SN_CRED_STORE_PATH) throw new Error('Sandbox mismatch');
+            await createStore(config).write('{}');
+            let refused=false;
+            try {await createStore({...config,store:'systemd-creds'}).read();} catch {refused=true;}
+            if(!refused) throw new Error('Encrypted backend did not refuse');
+            process.stdout.write('verified');
+        `;
+        const result = await run(['exec', '-e', 'SN_CRED_STORE=file', '-e',
+            'SN_CRED_STORE_PATH=' + directory + '/credentials.json', dockerContainer!,
+            'node', '--input-type=module', '-e', script]);
+        expect(result).toBe('verified');
+        await run(['exec', dockerContainer!, 'mkdir', directory + '/scripts']);
+        await run(['cp', resolve('scripts/verify-lock-recovery.mjs'), dockerContainer + ':' + directory + '/scripts/verify-lock-recovery.mjs']);
+        const recovery = await run(['exec', dockerContainer!, 'node', directory + '/scripts/verify-lock-recovery.mjs']);
+        expect(recovery.match(/40 exclusive writes/g)).toHaveLength(3);
+    } finally { await run(['exec', '-u', '0', dockerContainer!, 'rm', '-rf', directory]); }
+}, 90_000);
 
 /**
  * Phase 5 — the headless ladder, as executable tests.

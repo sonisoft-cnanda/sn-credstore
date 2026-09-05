@@ -122,8 +122,7 @@ lock is reclaimed.
 - **`setPassword` swallows errors and writes a sidecar.** Its upstream call site
   has no `try`/`catch`; throwing would lose a rotated refresh token permanently.
 - **`listAliases` reads the raw store, not the vault.** Going through the vault
-  would arm the refresh lease, so listing could block behind another process's
-  token refresh.
+  could recover pending writes under a lock; metadata listing must stay lock-free.
 
 ---
 
@@ -131,10 +130,11 @@ lock is reclaimed.
 
 The shim asserts the `sdk-cli` version is in a known-good allowlist
 (`KNOWN_GOOD_VERSIONS` in `src/shim/locateSdkCli.ts`) and that all three
-`KeyChain` methods exist before replacing them.
+`KeyChain` methods plus the wrapped SDK OAuth/mutation functions exist. Published
+SDK auth source hashes and behavior are pinned in `test/unit/shim/refresh.test.ts`.
 
-If a new SDK version ships, **read the new `keychain/index.js` before widening
-the allowlist**. The failure mode of a wrong assumption here is silent: the shim
+If a new SDK version ships, **read the new `keychain/index.js`, `auth/index.js` and
+`auth/OAuth/index.js` before widening the allowlist**. The failure mode of a wrong assumption here is silent: the shim
 patches something that is no longer called, the SDK falls back to the keyring,
 and the first write reseeds from a failed read and wipes the store.
 

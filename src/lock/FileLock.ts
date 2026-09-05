@@ -1,56 +1,16 @@
-/**
- * Advisory lock guarding mutations of the credential blob.
- *
- * Why not flock(2): Node has no core binding for it. The options are a native
- * addon (unacceptable for a zero-dependency package that must install cleanly
- * for the wrapper) or shelling out to flock(1), which ties the lock's lifetime
- * to a child process — awkward, because we hold this lock across an awaited
- * network round trip during OAuth refresh.
- *
- * So: O_EXCL lockfile, with explicit staleness detection. The tradeoff is that
- * we must handle stale locks ourselves rather than getting kernel-on-death
- * release for free. That is what bootId + pid liveness below is for.
- */
-import { open, readFile, unlink } from 'node:fs/promises';
-import { readFileSync, unlinkSync } from 'node:fs';
-import { hostname } from 'node:os';
+import { mkdir, readdir, readFile, unlink, stat, link, rm } from 'node:fs/promises';
+import { readFileSync, unlinkSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { LockTimeoutError } from '../errors.js';
-import { logger } from '../logger.js';
-import { FILE_MODE, ensureDir } from '../store/atomicFile.js';
-import { dirname } from 'node:path';
+import { DIR_MODE, ensureDir, writeFileAtomic } from '../store/atomicFile.js';
+import { currentOwner, namedOwnerIsDead, ownerIsDead, ownerName, Owner } from './owner.js';
 
-interface LockPayload {
-    pid: number;
-    hostname: string;
-    /** Distinguishes a live pid from a recycled one after a reboot. */
-    bootId: string | null;
+interface LockPayload extends Owner {
+    version: number;
+    nonce: string;
     startedAt: number;
     op: string;
-}
-
-/** Steal any lock older than this, on the assumption its holder died badly. */
-const DEFAULT_MAX_AGE_MS = 60_000;
-const BACKOFF_BASE_MS = 25;
-const BACKOFF_CAP_MS = 500;
-
-function readBootId(): string | null {
-    try {
-        return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    } catch {
-        return null;
-    }
-}
-
-const BOOT_ID = readBootId();
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, ms));
-}
-
-/** Full jitter — avoids the lockstep retry storm that a fixed backoff creates. */
-function backoffDelay(attempt: number): number {
-    const ceiling = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
-    return Math.random() * ceiling;
 }
 
 export interface LockHandle {
@@ -60,149 +20,163 @@ export interface LockHandle {
 
 export interface AcquireOptions {
     timeoutMs?: number;
+    /** Grace for an abandoned, empty legacy lock. Live owners never expire by age. */
     maxAgeMs?: number;
-    /** Recorded in the lockfile so a stuck lock says what it was doing. */
     op?: string;
 }
 
-/**
- * A held lock is registered here so process-exit handlers can clean up.
- * Belt and braces only — stale detection is the real backstop, because exit
- * handlers do not run on SIGKILL or OOM.
- */
-const held = new Set<string>();
-let exitHandlersInstalled = false;
+const held = new Map<string, { nonce: string; ticket: string }>();
+const tickets = new Set<string>();
+let installed = false;
+
+function ours(path: string, nonce: string): boolean {
+    try { return (JSON.parse(readFileSync(path, 'utf8')) as Partial<LockPayload>).nonce === nonce; }
+    catch { return false; }
+}
 
 function installExitHandlers(): void {
-    if (exitHandlersInstalled) return;
-    exitHandlersInstalled = true;
-
+    if (installed) return;
+    installed = true;
     const cleanup = (): void => {
-        for (const path of held) {
-            try {
-                // Must be sync: async work is not guaranteed to complete during
-                // 'exit', so an await here would silently leave the lock behind.
-                unlinkSync(path);
-            } catch {
-                /* already gone, or no longer ours */
-            }
+        for (const [path, lock] of held) {
+            try { if (ours(path, lock.nonce)) unlinkSync(path); } catch { /* already gone */ }
+        }
+        for (const ticket of tickets) {
+            try { rmSync(ticket, { recursive: true, force: true }); } catch { /* best effort */ }
         }
         held.clear();
+        tickets.clear();
     };
-
     process.on('exit', cleanup);
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-        process.on(sig, () => {
-            cleanup();
-            process.exit(sig === 'SIGINT' ? 130 : 143);
-        });
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+        process.on(signal, () => { cleanup(); process.exit(signal === 'SIGINT' ? 130 : 143); });
     }
 }
 
-async function readLock(path: string): Promise<LockPayload | null> {
+async function payloadAt(path: string): Promise<Partial<LockPayload> | null> {
     try {
-        return JSON.parse(await readFile(path, 'utf8')) as LockPayload;
-    } catch {
-        // Unparseable or vanished mid-read. Treat as stale rather than wedging
-        // forever on a corrupt lockfile.
-        return null;
+        const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+        return value !== null && typeof value === 'object' ? value as Partial<LockPayload> : null;
+    } catch (error: unknown) {
+        if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
     }
 }
 
-/**
- * A lock is stale when its holder is provably gone, or it is simply too old.
- *
- * The bootId check matters: after a reboot, pid N may well exist again as an
- * unrelated process, and `kill(pid, 0)` would report it alive forever.
- */
-function isStale(payload: LockPayload | null, maxAgeMs: number): boolean {
-    if (payload === null) return true;
-
-    const age = Date.now() - payload.startedAt;
-    if (age > maxAgeMs) {
-        logger.warn(`stealing lock held by pid ${payload.pid} for ${Math.round(age / 1000)}s (op=${payload.op})`);
-        return true;
+async function numberAt(ticket: string): Promise<number | null> {
+    try {
+        const value: unknown = JSON.parse(await readFile(join(ticket, 'number'), 'utf8'));
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return null;
+        return value;
+    } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return null;
+        throw error;
     }
-
-    const sameMachine = payload.hostname === hostname() && payload.bootId === BOOT_ID;
-    if (sameMachine && payload.bootId !== null) {
-        try {
-            process.kill(payload.pid, 0);
-            return false; // alive
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
-                logger.debug(`stealing lock from dead pid ${payload.pid}`);
-                return true;
-            }
-            // EPERM means it exists but belongs to another user — alive.
-            return false;
-        }
-    }
-    return false;
 }
 
+/** Acquire a local-filesystem mutex, retaining the legacy lockfile for older clients. */
 export async function acquireLock(path: string, options: AcquireOptions = {}): Promise<LockHandle> {
     const timeoutMs = options.timeoutMs ?? 20_000;
-    const maxAgeMs = options.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
-    const op = options.op ?? 'unknown';
-
+    const deadline = Date.now() + timeoutMs;
+    const owner = await currentOwner();
+    const nonce = randomUUID();
+    const queue = path + '.queue';
+    const name = `v1.${ownerName(owner)}.${nonce}`;
+    const ticket = join(queue, name);
+    const payload: LockPayload = { ...owner, version: 1, nonce, startedAt: Date.now(), op: options.op ?? 'unknown' };
     installExitHandlers();
     await ensureDir(dirname(path));
+    await ensureDir(queue);
+    await mkdir(ticket, { mode: DIR_MODE });
+    tickets.add(ticket);
 
-    const deadline = Date.now() + timeoutMs;
     let attempt = 0;
-
-    for (;;) {
-        try {
-            const handle = await open(path, 'wx', FILE_MODE);
-            const payload: LockPayload = {
-                pid: process.pid,
-                hostname: hostname(),
-                bootId: BOOT_ID,
-                startedAt: Date.now(),
-                op,
-            };
-            await handle.writeFile(JSON.stringify(payload), 'utf8');
-            await handle.close();
-            held.add(path);
-
-            let released = false;
-            return {
-                path,
-                release: async (): Promise<void> => {
-                    if (released) return;
-                    released = true;
-                    held.delete(path);
-                    await unlink(path).catch(() => {});
-                },
-            };
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-
-            if (isStale(await readLock(path), maxAgeMs)) {
-                await unlink(path).catch(() => {});
-                continue; // retry immediately after a steal
-            }
-
-            if (Date.now() >= deadline) {
-                const holder = await readLock(path);
-                throw new LockTimeoutError(
-                    `timed out after ${timeoutMs}ms waiting for ${path}` +
-                        (holder ? ` (held by pid ${holder.pid}, op=${holder.op}, age ${Date.now() - holder.startedAt}ms)` : ''),
-                    `Another process is updating the credential store. If nothing is running, remove the stale lock: rm ${path}`,
-                );
-            }
-            await sleep(backoffDelay(attempt++));
+    const wait = async (): Promise<void> => {
+        if (Date.now() >= deadline) {
+            throw new LockTimeoutError(
+                `timed out after ${timeoutMs}ms waiting for ${path}`,
+                'Another credential operation still owns the lock, or its owner cannot be identified. ' +
+                'Retry after that operation finishes. Do not remove a lock while credential clients are running.',
+            );
         }
+        await new Promise(resolve => setTimeout(resolve, Math.min(deadline - Date.now(), 10 + Math.random() * Math.min(250, 10 * 2 ** attempt++))));
+    };
+    const peers = async (): Promise<string[]> => {
+        const result: string[] = [];
+        for (const peer of await readdir(queue)) {
+            if (peer === name) continue;
+            if (peer.startsWith('v1.') && await namedOwnerIsDead(peer.slice(3))) {
+                await rm(join(queue, peer), { recursive: true, force: true });
+            } else result.push(peer);
+        }
+        return result;
+    };
+
+    try {
+        // Unique ticket paths prevent stale cleanup from unlinking a successor.
+        // A directory is the bakery choosing flag, with owner identity in its name.
+        let number = 1;
+        for (const peer of await peers()) number = Math.max(number, (await numberAt(join(queue, peer)) ?? 0) + 1);
+        if (!Number.isSafeInteger(number)) throw new Error('Credential lock queue exhausted');
+        await writeFileAtomic(join(ticket, 'number'), JSON.stringify(number));
+        for (;;) {
+            let blocked = false;
+            for (const peer of await peers()) {
+                if (!peer.startsWith('v1.')) { blocked = true; break; }
+                const other = await numberAt(join(queue, peer));
+                if (other === null) {
+                    if (await stat(join(queue, peer)).then(() => true, () => false)) blocked = true;
+                } else if (other < number || (other === number && peer < name)) blocked = true;
+                if (blocked) break;
+            }
+            if (!blocked) break;
+            await wait();
+        }
+
+        const prepared = join(ticket, 'payload');
+        await writeFileAtomic(prepared, JSON.stringify(payload));
+        for (;;) {
+            try {
+                // Link publishes a complete payload atomically; no empty-file window.
+                await link(prepared, path);
+                break;
+            } catch (error: unknown) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                const previous = await payloadAt(path);
+                const emptyAndOld = previous === null && await stat(path)
+                    .then(s => s.size === 0 && Date.now() - s.mtimeMs >= (options.maxAgeMs ?? 1000), () => false);
+                if ((previous !== null && await ownerIsDead(previous)) || emptyAndOld) {
+                    // Only the queue winner may reclaim the shared legacy path.
+                    await unlink(path).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
+                    continue;
+                }
+                if (await stat(path).then(() => false, error => (error as NodeJS.ErrnoException).code === 'ENOENT')) continue;
+                await wait();
+            }
+        }
+        held.set(path, { nonce, ticket });
+        let released = false;
+        return {
+            path,
+            release: async (): Promise<void> => {
+                if (released) return;
+                released = true;
+                if (ours(path, nonce)) await unlink(path);
+                held.delete(path);
+                tickets.delete(ticket);
+                await rm(ticket, { recursive: true, force: true });
+            },
+        };
+    } catch (error: unknown) {
+        tickets.delete(ticket);
+        await rm(ticket, { recursive: true, force: true });
+        throw error;
     }
 }
 
-/** Run `fn` while holding the lock. Always releases, including on throw. */
+/** Run a callback while holding the lock, releasing on success or failure. */
 export async function withLock<T>(path: string, options: AcquireOptions, fn: () => Promise<T>): Promise<T> {
     const lock = await acquireLock(path, options);
-    try {
-        return await fn();
-    } finally {
-        await lock.release();
-    }
+    try { return await fn(); }
+    finally { await lock.release(); }
 }
