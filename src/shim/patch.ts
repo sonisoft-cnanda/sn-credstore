@@ -24,11 +24,14 @@
  * unrecognised SDK version or a missing method aborts rather than continuing.
  */
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { loadConfig, ResolvedConfig } from '../config.js';
 import { logger } from '../logger.js';
 import { ShimPreconditionError } from '../errors.js';
 import { CredentialVault } from '../vault/CredentialVault.js';
 import { createStore } from '../store/StoreFactory.js';
+import { OAuthCred } from '../types.js';
 import {
     KEYCHAIN_PATH_RE,
     KNOWN_GOOD_VERSIONS,
@@ -40,6 +43,12 @@ import {
 
 /** Marks a prototype as already patched, so repeated installs are harmless. */
 const SHIM_SYMBOL = Symbol.for('@sonisoft/sn-credstore.patched');
+const OPERATION_SYMBOL = Symbol.for('@sonisoft/sn-credstore.operations');
+const OAUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]OAuth[/\\]index\.js$/;
+const AUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]index\.js$/;
+const REVIEWED_MODULE_DIGEST = 'b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1';
+const OAUTH_HASHES = new Set(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
+    'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd']);
 
 /** Set so downstream tools can assert the preload actually ran. */
 export const PATCHED_ENV_VAR = 'NOW_SDK_KEYCHAIN_PATCHED';
@@ -116,6 +125,58 @@ function patchPrototype(keychainPath: string, moduleExports: unknown, config: Re
     return true;
 }
 
+function patchOperations(path: string, value: unknown, config: ResolvedConfig): boolean {
+    if (!OAUTH_PATH_RE.test(path) && !AUTH_PATH_RE.test(path)) return false;
+    if (value === null || typeof value !== 'object') {
+        throw new ShimPreconditionError('SDK authentication module has an unexpected shape.', 'Verify the SDK auth implementation before enabling this shim.');
+    }
+    const mod = value as Record<string | symbol, unknown>;
+    if (mod[OPERATION_SYMBOL]) return false;
+    const keychainPath = OAUTH_PATH_RE.test(path)
+        ? path.replace(/OAuth[/\\]index\.js$/, 'keychain/index.js')
+        : path.replace(/index\.js$/, 'keychain/index.js');
+    const version = versionForKeychainPath(keychainPath);
+    if (version === null || !KNOWN_GOOD_VERSIONS.has(version)) {
+        throw new ShimPreconditionError('Unverified SDK authentication operation.', 'Use an SDK version in KNOWN_GOOD_VERSIONS.');
+    }
+    try {
+        const authPath = keychainPath.replace(/keychain[/\\]index\.js$/, 'index.js');
+        const authHash = createHash('sha256').update(readFileSync(authPath)).digest('hex');
+        const operationHash = createHash('sha256').update(readFileSync(path)).digest('hex');
+        if (authHash !== REVIEWED_MODULE_DIGEST || (OAUTH_PATH_RE.test(path) && !OAUTH_HASHES.has(operationHash))) throw new Error('unverified source');
+    } catch {
+        throw new ShimPreconditionError('SDK authentication source differs from the reviewed implementation.', 'Reinstall a supported SDK or review its auth source before updating the shim allowlist.');
+    }
+    if (OAUTH_PATH_RE.test(path)) {
+        const original = mod.refreshAccessToken;
+        if (typeof original !== 'function') throw new ShimPreconditionError('SDK refreshAccessToken is missing.', 'Verify the SDK auth implementation before enabling this shim.');
+        const refresh = original as (creds: OAuthCred) => Promise<Pick<OAuthCred, 'access_token' | 'refresh_token' | 'expires_at' | 'token_type'> | undefined>;
+        mod.refreshAccessToken = async (creds: OAuthCred): Promise<undefined> => {
+            await getVault(config).refreshCredentials(creds, refresh);
+            return undefined;
+        };
+    } else {
+        const names = ['storeCredentials', 'updateDefaultCredential', 'removeCredentials'];
+        for (const name of names) {
+            if (typeof mod[name] !== 'function') throw new ShimPreconditionError(`SDK ${name} is missing.`, 'Verify the SDK auth implementation before enabling this shim.');
+        }
+        for (const name of names) {
+            const original = mod[name];
+            const operation = original as (...args: unknown[]) => Promise<unknown>;
+            mod[name] = (...args: unknown[]): Promise<unknown> => getVault(config).withTransaction(
+                () => operation(...args), name, name === 'removeCredentials',
+            );
+        }
+    }
+    mod[OPERATION_SYMBOL] = true;
+    return true;
+}
+
+/** Patch a reviewed SDK operation module in compatibility fixtures. */
+export function patchSdkOperationModule(path: string, value: unknown, config: ResolvedConfig): boolean {
+    return patchOperations(path, value, config);
+}
+
 /** Patch one explicitly loaded module for real-package compatibility tests. */
 export function patchKeyChainModule(
     keychainPath: string,
@@ -152,6 +213,10 @@ export function installKeyChainShim(overrides: Partial<ResolvedConfig> = {}): Sh
         const cached = moduleInternals._cache?.[path] as { exports?: unknown } | undefined;
         if (cached?.exports && patchPrototype(path, cached.exports, config)) patchedFiles.push(path);
     }
+    for (const [path, cached] of Object.entries(moduleInternals._cache ?? {})) {
+        const value = (cached as { exports?: unknown }).exports;
+        if (value && patchOperations(path, value, config)) patchedFiles.push(path);
+    }
 
     const originalLoad = moduleInternals._load;
     if (typeof originalLoad !== 'function') {
@@ -172,6 +237,7 @@ export function installKeyChainShim(overrides: Partial<ResolvedConfig> = {}): Sh
             if (resolved !== undefined && KEYCHAIN_PATH_RE.test(resolved)) {
                 if (patchPrototype(resolved, result, config)) patchedFiles.push(resolved);
             }
+            if (resolved !== undefined && patchOperations(resolved, result, config)) patchedFiles.push(resolved);
         } catch (err) {
             // A precondition failure must surface — silently continuing would
             // leave the process on the broken keyring path.

@@ -56,7 +56,7 @@ export type KeyStore = Record<string, StoredCredential>;
 /** How long before expiry the SDK decides to refresh. Mirrors dist/auth/OAuth/index.js. */
 export const SDK_REFRESH_WINDOW_SEC = 15 * 60;
 
-/** Extra margin so we take the refresh lease slightly before the SDK would act. */
+/** @deprecated Legacy margin, retained for source compatibility; refresh uses the SDK's exact window. */
 export const REFRESH_SKEW_SEC = 60;
 
 export function isOAuthCred(creds: Creds): creds is OAuthCred {
@@ -66,7 +66,7 @@ export function isOAuthCred(creds: Creds): creds is OAuthCred {
 /** True when the SDK would attempt a refresh for this credential right now. */
 export function isInRefreshWindow(creds: Creds, nowSec: number = Math.floor(Date.now() / 1000)): boolean {
     if (!isOAuthCred(creds)) return false;
-    return creds.expires_at - nowSec <= SDK_REFRESH_WINDOW_SEC + REFRESH_SKEW_SEC;
+    return creds.expires_at - nowSec <= SDK_REFRESH_WINDOW_SEC;
 }
 
 /**

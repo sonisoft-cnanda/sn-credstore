@@ -95,18 +95,13 @@ export async function setDefaultAlias(
     config: ResolvedConfig = loadConfig(),
 ): Promise<boolean> {
     const vault = vaultFor(config);
-    const blob = await vault.getPassword();
-    const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias] === undefined) {
-        // getPassword may have taken the refresh lease expecting a write to
-        // follow. There is no write, so hand it back rather than making the next
-        // writer wait out the 30s bail timer.
-        await vault.abandonLease();
-        return false;
-    }
-
-    await vault.setPassword(serializeKeyStore(normalizeDefaults(store, alias)));
-    return true;
+    return vault.withTransaction(async () => {
+        const blob = await vault.getPassword();
+        const store = blob === null ? null : parseKeyStore(blob);
+        if (store === null || store[alias] === undefined) return false;
+        await vault.setPassword(serializeKeyStore(normalizeDefaults(store, alias)));
+        return true;
+    }, 'set-default');
 }
 
 /**
@@ -121,23 +116,15 @@ export async function deleteAlias(
     config: ResolvedConfig = loadConfig(),
 ): Promise<boolean> {
     const vault = vaultFor(config);
-    const blob = await vault.getPassword();
-    const store = blob === null ? null : parseKeyStore(blob);
-    if (store === null || store[alias] === undefined) {
-        // See setDefaultAlias — do not sit on a lease we will not use.
-        await vault.abandonLease();
-        return false;
-    }
-
-    const next = { ...store };
-    delete next[alias];
-
-    await vault.withRemovalIntent(async () => {
-        // normalizeDefaults promotes a survivor when the default was the alias
-        // just removed, so the SDK never sees a store with no default.
+    return vault.withTransaction(async () => {
+        const blob = await vault.getPassword();
+        const store = blob === null ? null : parseKeyStore(blob);
+        if (store === null || store[alias] === undefined) return false;
+        const next = { ...store };
+        delete next[alias];
         await vault.setPassword(serializeKeyStore(normalizeDefaults(next)));
-    });
-    return true;
+        return true;
+    }, 'delete-alias', true);
 }
 
 /** Remove every alias. */

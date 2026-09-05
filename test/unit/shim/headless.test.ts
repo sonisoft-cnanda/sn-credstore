@@ -13,7 +13,7 @@ const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
     const run = async (args: string[]): Promise<string> => {
         try {
             return (await execFileAsync('docker', args, {timeout: 30_000})).stdout;
-        } catch (error: unknown) { throw sanitizeProcessError(error); }
+        } catch (error: unknown) { throw new Error(JSON.stringify(sanitizeProcessError(error))); }
     };
     const directory = (await run(['exec', dockerContainer!, 'mktemp', '-d', '/tmp/sncs-headless-XXXXXX'])).trim();
     if (!directory.startsWith('/tmp/sncs-headless-')) throw new Error('Unexpected Docker sandbox');
@@ -36,6 +36,10 @@ const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
             'SN_CRED_STORE_PATH=' + directory + '/credentials.json', dockerContainer!,
             'node', '--input-type=module', '-e', script]);
         expect(result).toBe('verified');
+        await run(['exec', dockerContainer!, 'mkdir', directory + '/scripts']);
+        await run(['cp', resolve('scripts/verify-lock-recovery.mjs'), dockerContainer + ':' + directory + '/scripts/verify-lock-recovery.mjs']);
+        const recovery = await run(['exec', dockerContainer!, 'node', directory + '/scripts/verify-lock-recovery.mjs']);
+        expect(recovery.match(/40 exclusive writes/g)).toHaveLength(3);
     } finally { await run(['exec', '-u', '0', dockerContainer!, 'rm', '-rf', directory]); }
 }, 90_000);
 

@@ -42,14 +42,12 @@ function makeVault(store?: ICredentialStore): CredentialVault {
     return new CredentialVault(store ?? new FileStore(blobPath), { blobPath, lockTimeoutMs: 3000 });
 }
 
-describe('getPassword — never throws, but distinguishes empty from broken', () => {
+describe('getPassword — null means empty only', () => {
     it('returns null for a genuinely empty store', async () => {
         expect(await makeVault().getPassword()).toBeNull();
     });
 
-    it('returns null rather than throwing when the backend fails', async () => {
-        // The SDK has no try/catch around this; a throw would surface as the
-        // misleading "Default Credential has not been set".
+    it('propagates backend failures', async () => {
         const failing: ICredentialStore = {
             id: 'file',
             writable: true,
@@ -61,7 +59,7 @@ describe('getPassword — never throws, but distinguishes empty from broken', ()
             delete: async () => false,
             describe: () => 'failing',
         };
-        await expect(makeVault(failing).getPassword()).resolves.toBeNull();
+        await expect(makeVault(failing).getPassword()).rejects.toThrow('backend exploded');
     });
 
     it('refuses a corrupt blob and preserves a copy', async () => {
@@ -70,7 +68,7 @@ describe('getPassword — never throws, but distinguishes empty from broken', ()
         const store = new FileStore(blobPath);
         await store.write('{not json at all');
 
-        expect(await makeVault(store).getPassword()).toBeNull();
+        await expect(makeVault(store).getPassword()).rejects.toMatchObject({ code: 'STORE_CORRUPT' });
         expect((await readdir(dir)).some((f) => f.includes('.corrupt.'))).toBe(true);
     });
 });
@@ -188,76 +186,95 @@ describe('setPassword — the store-wipe guard', () => {
     });
 });
 
-describe('refresh lease — single-flight', () => {
-    it('does not return stale credentials after a lease timeout', async () => {
+describe('pending updates and API contention', () => {
+    it('recovers a pending rotation without reverting a later default change', async () => {
         const store = new FileStore(blobPath);
-        await store.write(blobOf(oauth('a', 300)));
-        const owner = makeVault(store);
-        await owner.getPassword();
-        try {
-            const contender = new CredentialVault(store, {blobPath, lockTimeoutMs: 1});
-            expect(await contender.getPassword()).toBeNull();
-        } finally { await owner.abandonLease(); }
+        const a = oauth('a', 9999);
+        const b = { ...oauth('b', 9999), isDefault: false };
+        const renewed = oauth('a', 19999, 'pending');
+        await store.write(blobOf(a, b));
+        const failing: ICredentialStore = {
+            id: 'file', writable: true, isAvailable: async () => true,
+            read: () => store.read(), delete: () => store.delete(), describe: () => 'fixture',
+            write: async () => { throw new Error('fixture write unavailable'); },
+        };
+        const vault = makeVault(failing);
+        await vault.getPassword();
+        await vault.setPassword(blobOf(renewed, b));
+        await store.write(blobOf({ ...a, isDefault: false }, { ...b, isDefault: true }));
+        const recovered = JSON.parse((await makeVault(store).getPassword())!) as KeyStore;
+        expect(recovered.a!.creds).toEqual(renewed.creds);
+        expect(recovered.a!.isDefault).toBe(false);
+        expect(recovered.b!.isDefault).toBe(true);
+        expect((await readdir(dir)).some(name => name.includes('.pending-'))).toBe(false);
     });
-    it('does not take a lease when nothing is near expiry', async () => {
-        const store = new FileStore(blobPath);
-        await store.write(blobOf(oauth('a', 86_400))); // a day out
 
-        await makeVault(store).getPassword();
-        // No lock left behind means the fast, lock-free path was taken.
-        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
+    it('propagates API contention without reporting an existing alias missing', async () => {
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 9999)));
+        const { setDefaultAlias, deleteAlias, listAliases } = await import('../../../src/api.js');
+        const { loadConfig } = await import('../../../src/config.js');
+        const config = { ...loadConfig(), store: 'file' as const, blobPath, lockTimeoutMs: 1 };
+        expect((await listAliases(config)).path).toBe(blobPath);
+        await makeVault(store).withTransaction(async () => {
+            await expect(setDefaultAlias('a', config)).rejects.toMatchObject({ code: 'LOCK_TIMEOUT' });
+            await expect(deleteAlias('a', config)).rejects.toMatchObject({ code: 'LOCK_TIMEOUT' });
+        });
     });
+});
 
-    it('holds a lease across getPassword when a token is inside the refresh window', async () => {
-        // 300s < the SDK's 900s window, so the SDK is about to refresh.
+describe('operation-scoped refresh', () => {
+    it('reads expired aliases without retaining a lock', async () => {
         const store = new FileStore(blobPath);
-        await store.write(blobOf(oauth('a', 300)));
-
+        await store.write(blobOf(oauth('a', -1)));
         const vault = makeVault(store);
         await vault.getPassword();
-        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(true);
-
-        // setPassword completes the pair and must release it.
-        await vault.setPassword(blobOf(oauth('a', 3600, 'refreshed')));
-        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
+        expect((await readdir(dir)).some(name => name.endsWith('.lock'))).toBe(false);
     });
 
-    it('a second holder skips the refresh once the first has renewed the token', async () => {
-        // This is the single-flight proof: the re-read under the lock shows the
-        // token is no longer in the window, so no duplicate token call happens.
+    it('retains exclusivity through refresh and persistence', async () => {
         const store = new FileStore(blobPath);
-        await store.write(blobOf(oauth('a', 300)));
-
-        const first = makeVault(store);
-        await first.getPassword(); // takes the lease
-        await first.setPassword(blobOf(oauth('a', 3600, 'refreshed'))); // renews + releases
-
-        const second = makeVault(store);
-        const blob = await second.getPassword();
-
-        expect(JSON.parse(blob!).a.creds.access_token).toBe('refreshed');
-        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
-    });
-
-    it('is reentrant — a second getPassword does not deadlock on our own lease', async () => {
-        // Regression: the SDK calls getCredentials more than once per command,
-        // so getPassword fires again while the lease from the first call is
-        // still held. This used to block on a lock the process already owned and
-        // burn the full 20s timeout. Observed live as "held by pid <self>".
-        const store = new FileStore(blobPath);
-        await store.write(blobOf(oauth('a', 300))); // inside the refresh window
-
+        await store.write(blobOf(oauth('a', -1)));
         const vault = makeVault(store);
+        const creds = (JSON.parse((await vault.getPassword())!) as KeyStore).a!.creds;
+        if (creds.type !== 'oauth') throw new Error('fixture mismatch');
+        await vault.refreshCredentials(creds, async () => {
+            const contender = new CredentialVault(store, { blobPath, lockTimeoutMs: 1 });
+            await expect(contender.withTransaction(async () => {})).rejects.toMatchObject({ code: 'LOCK_TIMEOUT' });
+            expect(await contender.getPassword()).not.toBeNull();
+            const renewed = oauth('a', 3600, 'renewed').creds;
+            if (renewed.type !== 'oauth') throw new Error('fixture mismatch');
+            return renewed;
+        });
+        expect(creds.access_token).toBe('renewed');
+        expect((JSON.parse((await store.read()).blob!) as KeyStore).a!.creds).toEqual(creds);
+        expect((await readdir(dir)).some(name => name.endsWith('.lock'))).toBe(false);
+    });
 
-        const started = Date.now();
-        await vault.getPassword(); // takes the lease
-        await vault.getPassword(); // must reuse it, not wait on it
-        const elapsed = Date.now() - started;
+    it('releases immediately when refresh fails', async () => {
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', -1)));
+        const vault = makeVault(store);
+        const creds = (JSON.parse((await vault.getPassword())!) as KeyStore).a!.creds;
+        if (creds.type !== 'oauth') throw new Error('fixture mismatch');
+        await expect(vault.refreshCredentials(creds, async () => { throw new Error('unavailable'); })).rejects.toThrow('unavailable');
+        await expect(makeVault(store).withTransaction(async () => true)).resolves.toBe(true);
+    });
 
-        // The bug made this take the full lock timeout (3000ms here).
-        expect(elapsed).toBeLessThan(1000);
+    it('does not lock or call refresh in the old 900–960 second skew band', async () => {
+        const vault = makeVault();
+        const creds = oauth('a', 950).creds;
+        if (creds.type !== 'oauth') throw new Error('fixture mismatch');
+        await vault.refreshCredentials(creds, async () => { throw new Error('must not refresh'); });
+        expect(await readdir(dir)).toEqual([]);
+    });
 
-        await vault.setPassword(blobOf(oauth('a', 3600, 'refreshed')));
-        expect((await readdir(dir)).some((f) => f.endsWith('.lock'))).toBe(false);
+    it('preserves a valid addition even when its incoming blob omits existing aliases', async () => {
+        const store = new FileStore(blobPath);
+        await store.write(blobOf(oauth('a', 9999), oauth('b', 9999)));
+        const vault = makeVault(store);
+        await vault.getPassword();
+        await vault.setPassword(blobOf(oauth('new', 9999)));
+        expect(Object.keys(JSON.parse((await store.read()).blob!)).sort()).toEqual(['a', 'b', 'new']);
     });
 });

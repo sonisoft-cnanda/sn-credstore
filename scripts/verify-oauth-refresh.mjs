@@ -5,8 +5,7 @@ import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import assert from 'node:assert/strict';
-import {listAliases} from '../dist/esm/index.js';
-import {sanitizeProcessError} from '../dist/esm/redact.js';
+import {listAliases, sanitizeProcessError} from '../dist/esm/index.js';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const sdkHome = process.env.SN_SDK_HOME && resolve(process.env.SN_SDK_HOME);
@@ -61,7 +60,7 @@ function run(args) {
         child.stdout.on('data', value => { output += value; });
         child.stderr.on('data', value => { output += value; });
         const timer = setTimeout(() => child.kill('SIGKILL'), 300000);
-        child.on('error', error => { clearTimeout(timer); sanitizeProcessError(error); reject(new Error('Child could not start')); });
+        child.on('error', error => { clearTimeout(timer); reject(new Error('Child could not start: ' + JSON.stringify(sanitizeProcessError(error)))); });
         child.on('close', (code, signal) => {
             clearTimeout(timer);
             const exposed = ['synthetic-access-', 'synthetic-refresh-', 'synthetic-password', 'synthetic-session']
@@ -79,6 +78,7 @@ async function verify() {
     assert.ok(data.test.creds.refresh_token === 'synthetic-refresh-new', 'Rotated refresh token was not persisted');
     assert.equal(Object.values(data).filter(value => value.isDefault).length, 1);
     assert.ok(!(await readdir(sandbox)).some(name => name.includes('.tmp.') || name.endsWith('.lock')));
+    assert.deepEqual(await readdir(path + '.lock.queue'), []);
 }
 try {
     await seed();
@@ -86,34 +86,52 @@ try {
     await Promise.all(Array.from({length: Number(process.env.REFRESH_CLIENTS || 20)}, () => run(['--require', join(root, 'preload.cjs'), '-e', resolver])));
     await verify();
     process.stdout.write('PASS: stripped-session SDK processes, exactly one refresh, aliases/default preserved, no secret output or leftover locks/temp files\n');
+    const beforeCrash = await readFile(path, 'utf8');
     const crashScript = `
         const fs = require('node:fs/promises');
         const {acquireLock} = require(process.argv[1] + '/dist/cjs/lock/FileLock.js');
         const {writeFileAtomic} = require(process.argv[1] + '/dist/cjs/store/atomicFile.js');
-        fs.rename = async () => { process.send('before-rename'); await new Promise(() => setInterval(() => {}, 1000)); };
+        const open = fs.open;
+        fs.open = async (path, ...args) => {
+            const handle = await open(path, ...args);
+            if (String(path).includes('.credentials.json.tmp.')) {
+                handle.writeFile = async content => {
+                    await handle.write(content.slice(0, Math.floor(content.length / 2)), 0, 'utf8');
+                    await handle.sync();
+                    process.send('mid-write');
+                    await new Promise(() => setInterval(() => {}, 1000));
+                };
+            }
+            return handle;
+        };
         (async () => {
             await acquireLock(process.env.SN_CRED_STORE_PATH + '.lock', {timeoutMs: 2000, op: 'crash-test'});
-            await writeFileAtomic(process.env.SN_CRED_STORE_PATH, await fs.readFile(process.env.SN_CRED_STORE_PATH, 'utf8'));
+            await writeFileAtomic(process.env.SN_CRED_STORE_PATH, JSON.stringify({replacement: 'x'.repeat(1024 * 1024)}));
         })().catch(() => process.exit(1));
     `;
     const crashed = spawn(process.execPath, ['-e', crashScript, root], {env, stdio: ['ignore', 'ignore', 'ignore', 'ipc']});
     await new Promise((ready, reject) => {
         const timer = setTimeout(() => { crashed.kill('SIGKILL'); reject(new Error('Crash fixture timed out')); }, 60000);
         crashed.once('message', () => { clearTimeout(timer); ready(); });
-        crashed.once('error', error => { clearTimeout(timer); sanitizeProcessError(error); reject(new Error('Crash fixture failed')); });
-        crashed.once('exit', () => { clearTimeout(timer); reject(new Error('Crash fixture exited before rename')); });
+        crashed.once('error', error => { clearTimeout(timer); reject(new Error('Crash fixture failed: ' + JSON.stringify(sanitizeProcessError(error)))); });
+        crashed.once('exit', () => { clearTimeout(timer); reject(new Error('Crash fixture exited before a partial write')); });
     });
     const killed = new Promise(done => crashed.once('exit', done));
     crashed.kill('SIGKILL');
     await killed;
     const survivingBlob = await readFile(path, 'utf8');
     assert.doesNotThrow(() => JSON.parse(survivingBlob));
-    // A refresh after reseeding must reclaim the dead process's lock.
+    assert.equal(survivingBlob, beforeCrash, 'Crash changed the previously committed blob');
+    const partials = (await readdir(sandbox)).filter(name => name.includes('.credentials.json.tmp.'));
+    assert.equal(partials.length, 1);
+    const partial = await readFile(join(sandbox, partials[0]));
+    assert.ok(partial.length > 0 && partial.length < 1024 * 1024, 'Fixture did not stop during a real partial write');
+    // All contenders encounter the dead holder together.
     await seed();
-    await run(['--require', join(root, 'preload.cjs'), '-e', resolver]);
+    await Promise.all(Array.from({length: 20}, () => run(['--require', join(root, 'preload.cjs'), '-e', resolver])));
     assert.equal(refreshes, 1);
     assert.ok(!(await readdir(sandbox)).some(name => name.endsWith('.lock')));
-    process.stdout.write('PASS: SIGKILL before atomic rename preserves JSON; next refresh reclaims stale lock\n');
+    process.stdout.write('PASS: SIGKILL during a partial write preserves the original blob; 20 contenders reclaim once\n');
     for (const name of await readdir(sandbox)) if (name.includes('.tmp.')) await rm(join(sandbox, name));
     await seed();
     await run([join(root, 'bin/now-sdk-wrapped.cjs'), 'query', 'sys_scope', '--query', 'sys_idISNOTEMPTY', '--auth', 'test', '--output', 'json']);
@@ -121,7 +139,7 @@ try {
     process.stdout.write('PASS: real now-sdk-x query refreshes and persists credentials\n');
     if (process.env.NEX_TEST_BIN) {
         await seed();
-        await run([resolve(process.env.NEX_TEST_BIN), 'query', '-t', 'sys_scope', '-q', 'sys_idISNOTEMPTY', '-a', 'test', '--cred-store', '--json']);
+        await run(['--require', join(root, 'preload.cjs'), resolve(process.env.NEX_TEST_BIN), 'query', '-t', 'sys_scope', '-q', 'sys_idISNOTEMPTY', '-a', 'test', '--cred-store', '--json']);
         await verify();
         process.stdout.write('PASS: real nex query refreshes and persists credentials\n');
     }

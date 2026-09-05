@@ -126,7 +126,10 @@ export function mergeKeyStores(
         const entry = incoming[alias];
         if (!entry) continue;
         const existing = merged[alias];
-        merged[alias] = existing ? pickNewer(existing, entry) : entry;
+        const winner = existing ? pickNewer(existing, entry) : entry;
+        merged[alias] = existing && base[alias]?.isDefault === entry.isDefault
+            ? { ...winner, isDefault: existing.isDefault }
+            : { ...winner, isDefault: entry.isDefault };
     }
 
     for (const alias of changes.removed) {
@@ -137,7 +140,7 @@ export function mergeKeyStores(
         }
     }
 
-    const preferred = Object.keys(incoming).find((k) => incoming[k]?.isDefault);
+    const preferred = Object.keys(incoming).find((k) => incoming[k]?.isDefault && !base[k]?.isDefault);
     return { merged: normalizeDefaults(merged, preferred), changes, protectedAliases };
 }
 
