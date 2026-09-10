@@ -46,7 +46,10 @@ const SHIM_SYMBOL = Symbol.for('@sonisoft/sn-credstore.patched');
 const OPERATION_SYMBOL = Symbol.for('@sonisoft/sn-credstore.operations');
 const OAUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]OAuth[/\\]index\.js$/;
 const AUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]index\.js$/;
-const REVIEWED_MODULE_DIGEST = 'b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1';
+const REVIEWED_AUTH_HASHES = new Set([
+    'b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1',
+    'f59db643397f587a02c60d705877c5e5227e2298550f3142aab358b78912d0ae',
+]);
 const OAUTH_HASHES = new Set(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
     'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd']);
 
@@ -143,7 +146,7 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
         const authPath = keychainPath.replace(/keychain[/\\]index\.js$/, 'index.js');
         const authHash = createHash('sha256').update(readFileSync(authPath)).digest('hex');
         const operationHash = createHash('sha256').update(readFileSync(path)).digest('hex');
-        if (authHash !== REVIEWED_MODULE_DIGEST || (OAUTH_PATH_RE.test(path) && !OAUTH_HASHES.has(operationHash))) throw new Error('unverified source');
+        if (!REVIEWED_AUTH_HASHES.has(authHash) || (OAUTH_PATH_RE.test(path) && !OAUTH_HASHES.has(operationHash))) throw new Error('unverified source');
     } catch {
         throw new ShimPreconditionError('SDK authentication source differs from the reviewed implementation.', 'Reinstall a supported SDK or review its auth source before updating the shim allowlist.');
     }

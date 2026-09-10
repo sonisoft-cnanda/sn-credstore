@@ -3,7 +3,7 @@
 Headless-safe credential storage for the ServiceNow SDK.
 
 Supported exact `@servicenow/sdk-cli` versions are `4.9.0`, `4.9.2`,
-`4.10.1`, `4.11.0`, and `4.11.2`. The shim intentionally fails closed for
+`4.10.1`, `4.11.0`, `4.11.2`, and `4.12.0`. The shim intentionally fails closed for
 unreviewed versions; `KNOWN_GOOD_VERSIONS` in `src/shim/locateSdkCli.ts` is the
 audited source of truth.
 

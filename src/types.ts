@@ -4,10 +4,10 @@
  * produced, byte-compatibly. Source of truth:
  *   node_modules/@servicenow/sdk-cli/dist/auth/index.d.ts
  *
- * Verified through @servicenow/sdk-cli 4.11.2. The keychain and stored auth
- * types remain byte-identical across the supported releases. The only reviewed
- * auth deltas add an empty scope to the authorization URL and simplify a refresh
- * error message; neither changes the stored Creds shape.
+ * Verified through @servicenow/sdk-cli 4.12.0. The keychain and stored auth
+ * types remain byte-identical across the supported releases. Reviewed auth
+ * deltas include the authorization scope/error-message changes and 4.12.0's
+ * direct OAuth bearer credential path; none changes the stored Creds shape.
  */
 
 /** Basic auth. Note the password is stored in CLEARTEXT inside the blob. */

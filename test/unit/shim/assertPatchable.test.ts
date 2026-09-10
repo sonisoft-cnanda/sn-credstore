@@ -39,7 +39,7 @@ afterAll(async () => {
 
 describe('assertPatchable version gate', () => {
     it('contains exactly the reviewed versions', () => {
-        expect([...KNOWN_GOOD_VERSIONS]).toEqual(['4.9.0', '4.9.2', '4.10.1', '4.11.0', '4.11.2']);
+        expect([...KNOWN_GOOD_VERSIONS]).toEqual(['4.9.0', '4.9.2', '4.10.1', '4.11.0', '4.11.2', '4.12.0']);
     });
 
     it.each([...KNOWN_GOOD_VERSIONS])('accepts verified version %s', async (version) => {
@@ -47,7 +47,7 @@ describe('assertPatchable version gate', () => {
         expect(() => assertPatchable(path, goodKeyChain())).not.toThrow();
     });
 
-    it.each(['4.8.0', '4.11.1', '4.12.0', '5.0.0'])('refuses unverified version %s', async (version) => {
+    it.each(['4.8.0', '4.11.1', '4.12.1', '5.0.0'])('refuses unverified version %s', async (version) => {
         const path = await keychainPathForVersion(version);
         let thrown: unknown;
         try {
