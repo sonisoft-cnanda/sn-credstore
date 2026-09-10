@@ -47,7 +47,10 @@ describe('reviewed SDK refresh boundary', () => {
         const oauthPath = join(fixture.packageRoot, 'dist/auth/OAuth/index.js');
         const authSource = await readFile(authPath, 'utf8');
         const oauthSource = await readFile(oauthPath, 'utf8');
-        expect(createHash('sha256').update(authSource).digest('hex')).toBe('b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1');
+        expect([
+            'b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1',
+            'f59db643397f587a02c60d705877c5e5227e2298550f3142aab358b78912d0ae',
+        ]).toContain(createHash('sha256').update(authSource).digest('hex'));
         expect(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
             'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd'])
             .toContain(createHash('sha256').update(oauthSource).digest('hex'));
@@ -62,8 +65,12 @@ describe('reviewed SDK refresh boundary', () => {
                     expires_at: Math.floor(Date.now() / 1000) + 3600, token_type: 'Bearer' };
             } }),
         } });
+        class LazyCredential {
+            constructor(public readonly url: URL, private readonly resolver: () => Promise<unknown>) {}
+            resolve(): Promise<unknown> { return this.resolver(); }
+        }
         const auth = evaluate(authSource, { '../logger': { logger }, './keychain': keychain,
-            '@servicenow/sdk-api': { LazyCredential: class {} }, './OAuth': oauth,
+            '@servicenow/sdk-api': { LazyCredential }, '@servicenow/sdk-api/credentials': { LazyCredential }, './OAuth': oauth,
             './OAuth/ClientCredentials': {}, './basic-auth': {}, 'tough-cookie': {} });
         // Capture before patching: core's ESM import can already hold this function.
         const getCredentials = auth.getCredentials as (alias?: string) => Promise<OAuthCred>;
@@ -75,6 +82,18 @@ describe('reviewed SDK refresh boundary', () => {
             await writeFile(blobPath, JSON.stringify({ selected: credential('selected', remaining, true), unused: credential('unused', -100) }), { mode: 0o600 });
         };
         await seed(950);
+        if (version === '4.12.0') {
+            // 4.12.0 removed the SDK's OAuth-to-CSRF/cookie conversion. The
+            // credential provider now consumes the same stored shape directly
+            // and returns a bearer credential; no CSRF request is owned by this
+            // shim or needed at this boundary.
+            const lazy = await (auth.credentialProvider as (alias: string) => Promise<LazyCredential>)('selected');
+            await expect(lazy.resolve()).resolves.toEqual({
+                type: 'oauth',
+                token: 'fabricated-access-selected',
+                expiresAt: expect.any(Number),
+            });
+        }
         expect((await getCredentials('selected')).expires_at).toBeGreaterThan(Date.now() / 1000 + 900);
         expect(refreshes).toBe(0);
         expect((await readdir(directory)).some(name => name.endsWith('.lock'))).toBe(false);
