@@ -44,6 +44,7 @@ import {
 /** Marks a prototype as already patched, so repeated installs are harmless. */
 const SHIM_SYMBOL = Symbol.for('@sonisoft/sn-credstore.patched');
 const OPERATION_SYMBOL = Symbol.for('@sonisoft/sn-credstore.operations');
+const TRANSACTION_REQUIRED_SYMBOL = Symbol.for('@sonisoft/sn-credstore.transaction-required');
 const OAUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]OAuth[/\\]index\.js$/;
 const AUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]index\.js$/;
 const REVIEWED_AUTH_HASHES = new Set([
@@ -53,6 +54,7 @@ const REVIEWED_AUTH_HASHES = new Set([
 const OAUTH_HASHES = new Set(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
     'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd']);
 const INITIALIZING_SYMBOL = Symbol.for('@sonisoft/sn-credstore.initializing-operations');
+const transactionRequiredPaths = new Set<string>();
 
 /** Set so downstream tools can assert the preload actually ran. */
 export const PATCHED_ENV_VAR = 'NOW_SDK_KEYCHAIN_PATCHED';
@@ -63,6 +65,7 @@ export interface KeyChainLike {
         setPassword?: (password: string) => Promise<void>;
         deletePassword?: () => Promise<boolean>;
         [SHIM_SYMBOL]?: boolean;
+        [TRANSACTION_REQUIRED_SYMBOL]?: boolean;
     };
 }
 
@@ -114,11 +117,19 @@ function patchPrototype(keychainPath: string, moduleExports: unknown, config: Re
     assertPatchable(keychainPath, exported);
 
     const proto = exported.prototype;
+    if (transactionRequiredPaths.has(keychainPath)) proto[TRANSACTION_REQUIRED_SYMBOL] = true;
     proto.getPassword = async function getPassword(): Promise<string | null> {
         return getVault(config).getPassword();
     };
     proto.setPassword = async function setPassword(password: string): Promise<void> {
-        return getVault(config).setPassword(password);
+        const vault = getVault(config);
+        if (proto[TRANSACTION_REQUIRED_SYMBOL] && !vault.isTransactionActive()) {
+            throw new ShimPreconditionError(
+                'SDK credential mutation was captured before its transaction wrapper was installed.',
+                'Load @sonisoft/sn-credstore/register before the SDK auth module or use the CommonJS preload.',
+            );
+        }
+        return vault.setPassword(password);
     };
     proto.deletePassword = async function deletePassword(): Promise<boolean> {
         return getVault(config).deletePassword();
@@ -148,6 +159,12 @@ function assertReviewedOperationSource(path: string): string {
     return keychainPath;
 }
 
+function requireTransactionForKeychain(keychainPath: string): void {
+    transactionRequiredPaths.add(keychainPath);
+    const cached = moduleInternals._cache?.[keychainPath]?.exports as { KeyChain?: KeyChainLike } | undefined;
+    if (cached?.KeyChain?.prototype) cached.KeyChain.prototype[TRANSACTION_REQUIRED_SYMBOL] = true;
+}
+
 function patchOperations(path: string, value: unknown, config: ResolvedConfig): boolean {
     if (!OAUTH_PATH_RE.test(path) && !AUTH_PATH_RE.test(path)) return false;
     if (value === null || typeof value !== 'object') {
@@ -155,7 +172,7 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
     }
     const mod = value as Record<string | symbol, unknown>;
     if (mod[OPERATION_SYMBOL]) return false;
-    assertReviewedOperationSource(path);
+    const keychainPath = assertReviewedOperationSource(path);
     if (OAUTH_PATH_RE.test(path)) {
         const original = mod.refreshAccessToken;
         if (typeof original !== 'function') throw new ShimPreconditionError('SDK refreshAccessToken is missing.', 'Verify the SDK auth implementation before enabling this shim.');
@@ -165,6 +182,13 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
             return undefined;
         };
     } else {
+        // Node's ESM facade snapshots named CommonJS exports. If auth was the
+        // first static import, those old function references cannot be replaced
+        // retroactively. Requiring an active transaction at the KeyChain write
+        // boundary makes such references fail closed instead of performing an
+        // unlocked read-modify-write. Calls through the patched CommonJS export
+        // continue normally under withTransaction().
+        requireTransactionForKeychain(keychainPath);
         const names = ['storeCredentials', 'updateDefaultCredential', 'removeCredentials'];
         for (const name of names) {
             if (typeof mod[name] !== 'function') throw new ShimPreconditionError(`SDK ${name} is missing.`, 'Verify the SDK auth implementation before enabling this shim.');

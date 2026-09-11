@@ -63,20 +63,44 @@ describe('published sdk-cli compatibility', () => {
             }
             process.stdout.write('verified');
         `;
-        const readBody = `
+        const authFirstBody = `
             const api = await import('@sonisoft/sn-credstore');
             if ((await api.listAliases()).path !== process.env.SN_CRED_STORE_PATH) throw new Error('sandbox path mismatch');
             if (await auth.getDefaultCredentials() !== undefined) throw new Error('expected an empty run-owned store');
+            const fabricated = {type:'basic',instanceUrl:'https://fixture.invalid',username:'fixture',password:'fabricated'};
+            const {createRequire} = await import('node:module');
+            const current = createRequire(import.meta.url)('@servicenow/sdk-cli/dist/auth/index.js');
+            await current.storeCredentials('blocked', fabricated, true);
+            await current.storeCredentials('other', fabricated, false);
+            for (const [name, operation] of [
+                ['store', () => auth.storeCredentials('captured', fabricated, false)],
+                ['default', () => auth.updateDefaultCredential('other')],
+                ['remove', () => auth.removeCredentials('blocked')],
+            ]) {
+                try { await operation(); throw new Error('captured ' + name + ' mutation did not fail closed'); }
+                catch (error) {
+                    if (error.code !== 'SHIM_PRECONDITION_FAILED') throw error;
+                }
+            }
+            await current.removeCredentials('blocked');
+            await current.removeCredentials('other');
+            await current.storeCredentials('first', fabricated, true);
+            await current.storeCredentials('second', fabricated, false);
+            await current.updateDefaultCredential('second');
+            await current.removeCredentials('first');
+            const aliases = await api.listAliases();
+            if (aliases.aliases.length !== 1 || aliases.aliases[0].alias !== 'second' || !aliases.aliases[0].isDefault) {
+                throw new Error('wrapped mutations did not persist safely');
+            }
             process.stdout.write('verified');
         `;
         const scripts: Array<[string, string, string[]]> = [
             ['register-first.mjs', `import '@sonisoft/sn-credstore/register';\nimport * as auth from '@servicenow/sdk-cli/dist/auth/index.js';\n${operationBody}`, []],
             // Node snapshots named CommonJS exports before the later register
-            // module can replace mutation functions in this order. The SDK's
-            // singleton still resolves keychain methods through its prototype,
-            // so the supported first credential read must use our store without
-            // ever constructing the native keyring entry.
-            ['auth-first.mjs', `import * as auth from '@servicenow/sdk-cli/dist/auth/index.js';\nimport '@sonisoft/sn-credstore/register';\n${readBody}`, []],
+            // module can replace mutation functions in this order. Reads remain
+            // safe through the patched prototype; captured mutations must fail
+            // closed, while the current CommonJS exports remain transactional.
+            ['auth-first.mjs', `import * as auth from '@servicenow/sdk-cli/dist/auth/index.js';\nimport '@sonisoft/sn-credstore/register';\n${authFirstBody}`, []],
             ['dynamic.mjs', `await import('@sonisoft/sn-credstore/register');\nconst auth = await import('@servicenow/sdk-cli/dist/auth/index.js');\n${operationBody}`, []],
             ['preload.cjs', `(async () => { const auth = require('@servicenow/sdk-cli/dist/auth/index.js');\n${operationBody} })().catch((error) => { console.error(error.message); process.exitCode = 1; });`, [
                 '--require', join(consumerDir, 'node_modules', '@sonisoft', 'sn-credstore', 'preload.cjs'),
