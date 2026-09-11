@@ -44,6 +44,7 @@ import {
 /** Marks a prototype as already patched, so repeated installs are harmless. */
 const SHIM_SYMBOL = Symbol.for('@sonisoft/sn-credstore.patched');
 const OPERATION_SYMBOL = Symbol.for('@sonisoft/sn-credstore.operations');
+const TRANSACTION_REQUIRED_SYMBOL = Symbol.for('@sonisoft/sn-credstore.transaction-required');
 const OAUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]OAuth[/\\]index\.js$/;
 const AUTH_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]index\.js$/;
 const REVIEWED_AUTH_HASHES = new Set([
@@ -52,6 +53,8 @@ const REVIEWED_AUTH_HASHES = new Set([
 ]);
 const OAUTH_HASHES = new Set(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
     'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd']);
+const INITIALIZING_SYMBOL = Symbol.for('@sonisoft/sn-credstore.initializing-operations');
+const transactionRequiredPaths = new Set<string>();
 
 /** Set so downstream tools can assert the preload actually ran. */
 export const PATCHED_ENV_VAR = 'NOW_SDK_KEYCHAIN_PATCHED';
@@ -62,6 +65,7 @@ export interface KeyChainLike {
         setPassword?: (password: string) => Promise<void>;
         deletePassword?: () => Promise<boolean>;
         [SHIM_SYMBOL]?: boolean;
+        [TRANSACTION_REQUIRED_SYMBOL]?: boolean;
     };
 }
 
@@ -113,11 +117,19 @@ function patchPrototype(keychainPath: string, moduleExports: unknown, config: Re
     assertPatchable(keychainPath, exported);
 
     const proto = exported.prototype;
+    if (transactionRequiredPaths.has(keychainPath)) proto[TRANSACTION_REQUIRED_SYMBOL] = true;
     proto.getPassword = async function getPassword(): Promise<string | null> {
         return getVault(config).getPassword();
     };
     proto.setPassword = async function setPassword(password: string): Promise<void> {
-        return getVault(config).setPassword(password);
+        const vault = getVault(config);
+        if (proto[TRANSACTION_REQUIRED_SYMBOL] && !vault.isTransactionActive()) {
+            throw new ShimPreconditionError(
+                'SDK credential mutation was captured before its transaction wrapper was installed.',
+                'Load @sonisoft/sn-credstore/register before the SDK auth module or use the CommonJS preload.',
+            );
+        }
+        return vault.setPassword(password);
     };
     proto.deletePassword = async function deletePassword(): Promise<boolean> {
         return getVault(config).deletePassword();
@@ -128,13 +140,7 @@ function patchPrototype(keychainPath: string, moduleExports: unknown, config: Re
     return true;
 }
 
-function patchOperations(path: string, value: unknown, config: ResolvedConfig): boolean {
-    if (!OAUTH_PATH_RE.test(path) && !AUTH_PATH_RE.test(path)) return false;
-    if (value === null || typeof value !== 'object') {
-        throw new ShimPreconditionError('SDK authentication module has an unexpected shape.', 'Verify the SDK auth implementation before enabling this shim.');
-    }
-    const mod = value as Record<string | symbol, unknown>;
-    if (mod[OPERATION_SYMBOL]) return false;
+function assertReviewedOperationSource(path: string): string {
     const keychainPath = OAUTH_PATH_RE.test(path)
         ? path.replace(/OAuth[/\\]index\.js$/, 'keychain/index.js')
         : path.replace(/index\.js$/, 'keychain/index.js');
@@ -150,6 +156,23 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
     } catch {
         throw new ShimPreconditionError('SDK authentication source differs from the reviewed implementation.', 'Reinstall a supported SDK or review its auth source before updating the shim allowlist.');
     }
+    return keychainPath;
+}
+
+function requireTransactionForKeychain(keychainPath: string): void {
+    transactionRequiredPaths.add(keychainPath);
+    const cached = moduleInternals._cache?.[keychainPath]?.exports as { KeyChain?: KeyChainLike } | undefined;
+    if (cached?.KeyChain?.prototype) cached.KeyChain.prototype[TRANSACTION_REQUIRED_SYMBOL] = true;
+}
+
+function patchOperations(path: string, value: unknown, config: ResolvedConfig): boolean {
+    if (!OAUTH_PATH_RE.test(path) && !AUTH_PATH_RE.test(path)) return false;
+    if (value === null || typeof value !== 'object') {
+        throw new ShimPreconditionError('SDK authentication module has an unexpected shape.', 'Verify the SDK auth implementation before enabling this shim.');
+    }
+    const mod = value as Record<string | symbol, unknown>;
+    if (mod[OPERATION_SYMBOL]) return false;
+    const keychainPath = assertReviewedOperationSource(path);
     if (OAUTH_PATH_RE.test(path)) {
         const original = mod.refreshAccessToken;
         if (typeof original !== 'function') throw new ShimPreconditionError('SDK refreshAccessToken is missing.', 'Verify the SDK auth implementation before enabling this shim.');
@@ -159,6 +182,13 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
             return undefined;
         };
     } else {
+        // Node's ESM facade snapshots named CommonJS exports. If auth was the
+        // first static import, those old function references cannot be replaced
+        // retroactively. Requiring an active transaction at the KeyChain write
+        // boundary makes such references fail closed instead of performing an
+        // unlocked read-modify-write. Calls through the patched CommonJS export
+        // continue normally under withTransaction().
+        requireTransactionForKeychain(keychainPath);
         const names = ['storeCredentials', 'updateDefaultCredential', 'removeCredentials'];
         for (const name of names) {
             if (typeof mod[name] !== 'function') throw new ShimPreconditionError(`SDK ${name} is missing.`, 'Verify the SDK auth implementation before enabling this shim.');
@@ -172,6 +202,69 @@ function patchOperations(path: string, value: unknown, config: ResolvedConfig): 
         }
     }
     mod[OPERATION_SYMBOL] = true;
+    return true;
+}
+
+/**
+ * Arm an auth module that Node has cached before evaluating its CommonJS body.
+ *
+ * Static ESM imports are linked before evaluation. When an ESM entry point
+ * imports both /register and the SDK auth module, Node can therefore expose the
+ * auth module in Module._cache with `loaded=false` and an empty exports object
+ * while /register is running. Treating that object as a finished module causes
+ * a false missing-method failure. Ignoring it is also unsafe: its eventual load
+ * does not necessarily pass through our later Module._load hook.
+ *
+ * The reviewed SDK sources publish their operation functions via ordinary
+ * assignments to the exports object. Accessors let those assignments complete
+ * normally, then synchronously replace the reviewed operations as soon as the
+ * complete required set exists. No credential caller can observe an unwrapped
+ * exported function in between.
+ */
+function watchInitializingOperations(path: string, value: unknown, config: ResolvedConfig): boolean {
+    if (!OAUTH_PATH_RE.test(path) && !AUTH_PATH_RE.test(path)) return false;
+    if (value === null || typeof value !== 'object') return false;
+    const mod = value as Record<string | symbol, unknown>;
+    if (mod[OPERATION_SYMBOL] || mod[INITIALIZING_SYMBOL]) return false;
+    // Validate the file and exact SDK version before accepting a deferred
+    // module. For reviewed sources, the required top-of-file assignments are
+    // guaranteed; a modified source that omits one fails now rather than
+    // leaving an armed-but-never-completed installation.
+    assertReviewedOperationSource(path);
+
+    const names = OAUTH_PATH_RE.test(path)
+        ? ['refreshAccessToken']
+        : ['storeCredentials', 'updateDefaultCredential', 'removeCredentials'];
+    const values = new Map<string, unknown>();
+    for (const name of names) {
+        if (Object.prototype.hasOwnProperty.call(mod, name)) values.set(name, mod[name]);
+    }
+    mod[INITIALIZING_SYMBOL] = true;
+
+    let completed = false;
+    const completeIfReady = (): void => {
+        if (completed || names.some((name) => typeof values.get(name) !== 'function')) return;
+        completed = true;
+        for (const name of names) {
+            delete mod[name];
+            mod[name] = values.get(name);
+        }
+        delete mod[INITIALIZING_SYMBOL];
+        patchOperations(path, mod, config);
+    };
+
+    for (const name of names) {
+        Object.defineProperty(mod, name, {
+            configurable: true,
+            enumerable: true,
+            get: () => values.get(name),
+            set: (operation: unknown) => {
+                values.set(name, operation);
+                completeIfReady();
+            },
+        });
+    }
+    completeIfReady();
     return true;
 }
 
@@ -213,12 +306,17 @@ export function installKeyChainShim(overrides: Partial<ResolvedConfig> = {}): Sh
 
     // 1. Anything already loaded.
     for (const path of findLoadedKeychainModules()) {
-        const cached = moduleInternals._cache?.[path] as { exports?: unknown } | undefined;
+        const cached = moduleInternals._cache?.[path];
         if (cached?.exports && patchPrototype(path, cached.exports, config)) patchedFiles.push(path);
     }
     for (const [path, cached] of Object.entries(moduleInternals._cache ?? {})) {
-        const value = (cached as { exports?: unknown }).exports;
-        if (value && patchOperations(path, value, config)) patchedFiles.push(path);
+        const value = cached.exports;
+        if (!value) continue;
+        if (cached.loaded === false) {
+            if (watchInitializingOperations(path, value, config)) patchedFiles.push(path);
+        } else if (patchOperations(path, value, config)) {
+            patchedFiles.push(path);
+        }
     }
 
     const originalLoad = moduleInternals._load;

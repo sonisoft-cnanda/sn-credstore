@@ -52,6 +52,11 @@ export class CredentialVault {
         return operation?.active ? operation : undefined;
     }
 
+    /** True only while a reviewed SDK mutation wrapper owns the transaction. */
+    isTransactionActive(): boolean {
+        return this.operation()?.locked === true;
+    }
+
     private remember(store: KeyStore): void {
         for (const [alias, entry] of Object.entries(store)) {
             if (entry.creds.type !== 'oauth') continue;
