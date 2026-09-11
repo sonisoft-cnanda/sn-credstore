@@ -24,9 +24,15 @@ import { readFileSync, existsSync } from 'node:fs';
  * identically under both.
  */
 interface ModuleInternals {
-    _cache?: Record<string, unknown>;
+    _cache?: Record<string, CachedModuleLike>;
     _resolveFilename?: (request: string, parent: unknown, isMain: boolean) => string;
     _load?: (request: string, parent: unknown, isMain: boolean) => unknown;
+}
+
+export interface CachedModuleLike {
+    exports?: unknown;
+    /** False while Node is evaluating a CommonJS module. */
+    loaded?: boolean;
 }
 
 export const moduleInternals = Module as unknown as ModuleInternals;

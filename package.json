@@ -46,6 +46,7 @@
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "node --experimental-vm-modules node_modules/.bin/jest --forceExit",
     "test:unit": "node --experimental-vm-modules node_modules/.bin/jest --forceExit --coverage --ci",
+    "test:eval": "node --experimental-vm-modules node_modules/.bin/jest test/unit/shim/assertPatchable.test.ts test/unit/shim/realPackage.test.ts test/unit/shim/refresh.test.ts --runInBand --forceExit",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },
   "keywords": [
