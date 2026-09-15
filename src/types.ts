@@ -4,9 +4,9 @@
  * produced, byte-compatibly. Source of truth:
  *   node_modules/@servicenow/sdk-cli/dist/auth/index.d.ts
  *
- * Verified through @servicenow/sdk-cli 4.12.0. The keychain and stored auth
+ * Verified through @servicenow/sdk-cli 4.12.2. The keychain and stored auth
  * types remain byte-identical across the supported releases. Reviewed auth
- * deltas include the authorization scope/error-message changes and 4.12.0's
+ * deltas include the authorization scope/error-message changes and 4.12.x's
  * direct OAuth bearer credential path; none changes the stored Creds shape.
  */
 

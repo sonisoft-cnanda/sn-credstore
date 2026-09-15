@@ -39,13 +39,13 @@ describe('published sdk-cli compatibility', () => {
         delete npmEnv.npm_config_allow_scripts;
         await execFileAsync('npm', [
             'install', '--userconfig=/dev/null', '--ignore-scripts', '--no-audit', '--no-fund',
-            '@servicenow/sdk-cli@4.12.0', tarball,
+            '@servicenow/sdk-cli@4.12.1', tarball,
         ], { cwd: consumerDir, env: npmEnv, timeout: 120_000 });
         const nestedDir = join(consumerDir, 'nested');
         await mkdir(nestedDir);
         await execFileAsync('npm', [
             'install', '--userconfig=/dev/null', '--ignore-scripts', '--no-audit', '--no-fund',
-            '@servicenow/sdk-cli@4.12.0',
+            '@servicenow/sdk-cli@4.12.1',
         ], { cwd: nestedDir, env: npmEnv, timeout: 120_000 });
 
         const operationBody = `
