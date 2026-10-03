@@ -82,8 +82,8 @@ describe('reviewed SDK refresh boundary', () => {
             await writeFile(blobPath, JSON.stringify({ selected: credential('selected', remaining, true), unused: credential('unused', -100) }), { mode: 0o600 });
         };
         await seed(950);
-        if (version.startsWith('4.12.')) {
-            // 4.12.x removed the SDK's OAuth-to-CSRF/cookie conversion. The
+        if (version.startsWith('4.12.') || version.startsWith('4.13.')) {
+            // 4.12.0+ removed the SDK's OAuth-to-CSRF/cookie conversion. The
             // credential provider now consumes the same stored shape directly
             // and returns a bearer credential; no CSRF request is owned by this
             // shim or needed at this boundary.

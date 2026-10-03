@@ -49,15 +49,18 @@ export const KEYCHAIN_PATH_RE = /@servicenow[/\\]sdk-cli[/\\]dist[/\\]auth[/\\]k
  * bodies wholesale, so an unreviewed version could change semantics under us
  * without any signal. Better to refuse and be told than to silently mispatch.
  *
- * The keychain seam in every listed release through 4.12.2 is byte-identical (sha256
+ * The keychain seam in every listed release through 4.13.3 is byte-identical (sha256
  * 1de3ae85c2f856931d3528982a5a5419f9788b0053f77239c8a9a0f587d3e129).
  * 4.12.0's auth module removes the old OAuth-to-CSRF session conversion but
- * preserves the keychain mutations and refresh boundary wrapped here; 4.12.1
- * and 4.12.2 ship that same auth/OAuth source (hashes f59db643… / ee0c6926…).
- * The registry never published 4.11.1; 4.9.1 and 4.10.0 remain unlisted because
- * they were not reviewed, not by oversight.
+ * preserves the keychain mutations and refresh boundary wrapped here; 4.12.1,
+ * 4.12.2, 4.13.0 and 4.13.3 ship that same auth/OAuth source (hashes f59db643… /
+ * ee0c6926…). 4.13.x's only auth change is interactive MFA in the basic-auth UI
+ * session login (basic-auth/UISession.js, mfa-code-prompt.js), which never
+ * reaches the keychain or the stored credential shape.
+ * The registry never published 4.11.1, 4.13.1 or 4.13.2; 4.9.1 and 4.10.0 remain
+ * unlisted because they were not reviewed, not by oversight.
  */
-export const KNOWN_GOOD_VERSIONS = new Set(['4.9.0', '4.9.2', '4.10.1', '4.11.0', '4.11.2', '4.12.0', '4.12.1', '4.12.2']);
+export const KNOWN_GOOD_VERSIONS = new Set(['4.9.0', '4.9.2', '4.10.1', '4.11.0', '4.11.2', '4.12.0', '4.12.1', '4.12.2', '4.13.0', '4.13.3']);
 
 export interface SdkCliCandidate {
     keychainPath: string;
