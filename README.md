@@ -3,9 +3,9 @@
 Headless-safe credential storage for the ServiceNow SDK.
 
 Supported exact `@servicenow/sdk-cli` versions are `4.9.0`, `4.9.2`,
-`4.10.1`, `4.11.0`, `4.11.2`, `4.12.0`, `4.12.1`, and `4.12.2`. The shim
-intentionally fails closed for unreviewed versions; `KNOWN_GOOD_VERSIONS` in
-`src/shim/locateSdkCli.ts` is the audited source of truth.
+`4.10.1`, `4.11.0`, `4.11.2`, `4.12.0`, `4.12.1`, `4.12.2`, `4.13.0`, and
+`4.13.3`. The shim intentionally fails closed for unreviewed versions;
+`KNOWN_GOOD_VERSIONS` in `src/shim/locateSdkCli.ts` is the audited source of truth.
 
 Lets non-interactive sessions — SSH, `systemd` units, CI runners, AI agents —
 share the OAuth credentials that the OS keyring cannot serve them, without
