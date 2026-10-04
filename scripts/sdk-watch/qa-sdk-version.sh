@@ -83,7 +83,7 @@ else
 fi
 rm -rf "$sandbox"
 
-node - "$results" "$artifacts" "$@" <<'EOF'
+node --input-type=commonjs - "$results" "$artifacts" "$@" <<'EOF'
 const [results, artifacts, ...versions] = process.argv.slice(2);
 const steps = require('node:fs').readFileSync(results, 'utf8').trim().split('\n').filter(Boolean)
     .map((l) => { const [name, status, seconds, detail] = l.split('\t'); return { name, status, seconds: Number(seconds), detail }; });
