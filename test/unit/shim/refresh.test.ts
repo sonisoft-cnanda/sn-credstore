@@ -33,6 +33,13 @@ function credential(alias: string, remaining: number, isDefault = false): Stored
         expires_at: Math.floor(Date.now() / 1000) + remaining, token_type: 'Bearer' } };
 }
 
+/**
+ * The reviewed auth source that dropped the OAuth-to-CSRF conversion (4.12.0+).
+ * Branching on the source rather than on a version prefix means allowlisting a new
+ * release that ships this same source needs no edit here.
+ */
+const AUTH_WITHOUT_CSRF_CONVERSION = 'f59db643397f587a02c60d705877c5e5227e2298550f3142aab358b78912d0ae';
+
 describe('reviewed SDK refresh boundary', () => {
     it.each([...KNOWN_GOOD_VERSIONS])('preserves auth semantics in published SDK %s', async version => {
         const fixture = await ensureSdkCliFixture(version);
@@ -47,10 +54,11 @@ describe('reviewed SDK refresh boundary', () => {
         const oauthPath = join(fixture.packageRoot, 'dist/auth/OAuth/index.js');
         const authSource = await readFile(authPath, 'utf8');
         const oauthSource = await readFile(oauthPath, 'utf8');
+        const authHash = createHash('sha256').update(authSource).digest('hex');
         expect([
             'b30fa90d9b440818499699249f5585fb143ec273665a80a008e4996c94ae58b1',
-            'f59db643397f587a02c60d705877c5e5227e2298550f3142aab358b78912d0ae',
-        ]).toContain(createHash('sha256').update(authSource).digest('hex'));
+            AUTH_WITHOUT_CSRF_CONVERSION,
+        ]).toContain(authHash);
         expect(['1a8a9623bff7cb3ad0bc76b00c7394b1386d3dd31ac00101916df33dd24da39f',
             'ee0c69264c990395f32d1e3206e5c5e0202d8d85207dd8db08d779748caf35bd'])
             .toContain(createHash('sha256').update(oauthSource).digest('hex'));
@@ -82,7 +90,7 @@ describe('reviewed SDK refresh boundary', () => {
             await writeFile(blobPath, JSON.stringify({ selected: credential('selected', remaining, true), unused: credential('unused', -100) }), { mode: 0o600 });
         };
         await seed(950);
-        if (version.startsWith('4.12.') || version.startsWith('4.13.')) {
+        if (authHash === AUTH_WITHOUT_CSRF_CONVERSION) {
             // 4.12.0+ removed the SDK's OAuth-to-CSRF/cookie conversion. The
             // credential provider now consumes the same stored shape directly
             // and returns a bearer credential; no CSRF request is owned by this
