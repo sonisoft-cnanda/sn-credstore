@@ -47,7 +47,14 @@ describe('assertPatchable version gate', () => {
         expect(() => assertPatchable(path, goodKeyChain())).not.toThrow();
     });
 
-    it.each(['4.8.0', '4.11.1', '4.13.1', '4.14.0', '5.0.0'])('refuses unverified version %s', async (version) => {
+    // Derived from the newest reviewed release, so allowlisting a new version never
+    // turns one of these into an accepted one. 4.8.0 predates the shim; 4.11.1 was
+    // never published.
+    const newest = [...KNOWN_GOOD_VERSIONS].map((v) => v.split('.').map(Number))
+        .sort((a, b) => a[0]! - b[0]! || a[1]! - b[1]! || a[2]! - b[2]!).at(-1)!;
+    const unreviewed = ['4.8.0', '4.11.1', `${newest[0]}.${newest[1]! + 1}.0`, `${newest[0]! + 1}.0.0`];
+
+    it.each(unreviewed)('refuses unverified version %s', async (version) => {
         const path = await keychainPathForVersion(version);
         let thrown: unknown;
         try {
