@@ -64,12 +64,13 @@ describe('reviewed SDK refresh boundary', () => {
             .toContain(createHash('sha256').update(oauthSource).digest('hex'));
         let refreshes = 0;
         let failRefresh = false;
+        let omitRefreshToken = false;
         const logger = { info: (): void => {}, error: (): void => {} };
         const oauth = evaluate(oauthSource, { '../../logger': { logger }, './CodeGrant': {
             oAuthClient: async () => ({ refresh: async () => {
                 refreshes++;
                 if (failRefresh) throw new Error('fixture unavailable');
-                return { access_token: 'fabricated-renewed', refresh_token: 'fabricated-rotated',
+                return { access_token: 'fabricated-renewed', refresh_token: omitRefreshToken ? undefined : 'fabricated-rotated',
                     expires_at: Math.floor(Date.now() / 1000) + 3600, token_type: 'Bearer' };
             } }),
         } });
@@ -117,6 +118,12 @@ describe('reviewed SDK refresh boundary', () => {
         expect(refreshes).toBe(1);
         await add('added', credential('added', 9999).creds as OAuthCred, false);
         expect(Object.keys(JSON.parse(await readFile(blobPath, 'utf8')))).toHaveLength(3);
+        await seed(-1);
+        omitRefreshToken = true;
+        const withoutReplacement = await getCredentials('selected');
+        expect(withoutReplacement.refresh_token).toBe('fabricated-refresh-selected');
+        const retained = JSON.parse(await readFile(blobPath, 'utf8')) as KeyStore;
+        expect(retained.selected!.creds).toEqual(withoutReplacement);
         await seed(-1);
         failRefresh = true;
         await expect(getCredentials('selected')).rejects.toThrow('Error refreshing token');

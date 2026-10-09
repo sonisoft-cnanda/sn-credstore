@@ -73,13 +73,18 @@ export class SystemdCredsStore implements ICredentialStore {
         let envelope: Envelope;
         try {
             envelope = JSON.parse(content) as Envelope;
-        } catch (err) {
+        } catch {
             throw new StoreDecryptError(
                 `${this.blobPath} is not a valid sn-credstore envelope`,
                 `The file may be truncated or from an incompatible version. ` +
                     `Move it aside and re-import: sn-credstore import --from keyring`,
-                { storeId: this.id, cause: err },
+                { storeId: this.id },
             );
+        }
+
+        if (envelope === null || typeof envelope !== 'object' || envelope.version !== 1 ||
+            typeof envelope.ciphertext !== 'string' || !envelope.ciphertext) {
+            throw new StoreDecryptError('Credential store is not a systemd-creds envelope.', 'Select the original backend or re-import on this host.', { storeId: this.id });
         }
 
         let plaintext: string;

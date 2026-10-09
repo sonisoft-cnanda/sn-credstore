@@ -416,3 +416,29 @@ chooser, a published lock, and a held lock with 20 processes and 40 writes each.
 Docker coverage repeats those lock cases on Linux and is opt-in;
 the container needs Node and no systemd credential service. No real token belongs
 in these fixtures.
+
+### Credential transfer API
+
+`readCredentialSnapshot(config?)` returns a strictly validated deep copy of the
+SDK keystore, **including passwords and tokens**. Keep snapshots out of logs.
+An empty backend returns `{}`; malformed data or a mismatched backend fails.
+Transfer APIs and CLI import never recover pending writes: unresolved sidecars fail with
+recovery instructions, leaving the credential blob and sidecars unchanged.
+
+`applyCredentialChanges(changes, config?)` accepts
+`{ alias, expected: Creds | null, creds: Creds }` entries. `expected: null`
+requires an absent alias; otherwise every credential field must match the
+current store. All entries are checked under the vault lock before one atomic
+write. A `CredentialConflictError` (`CREDENTIAL_CONFLICT`) contains only affected
+aliases. Read a fresh snapshot and review replacements before retrying.
+Validation, pending-recovery, and expected-credential failures leave the blob
+unchanged. A write or verification error can occur after an atomic commit;
+read a fresh snapshot and inspect the replacements before retrying.
+
+Replacements preserve local defaults and unrelated aliases, including OAuth
+grants with shorter expiry. New aliases use `isDefault: false`; select a default
+explicitly with `setDefaultAlias`. No removals are supported. Inputs require
+complete SDK fields, matching entry aliases, and safe object keys; duplicate
+changes and prototype-related aliases are rejected. CLI import uses the same
+lock and preserves existing defaults; the first import selects a source default
+in the same atomic write (or the first alias if the source has none).

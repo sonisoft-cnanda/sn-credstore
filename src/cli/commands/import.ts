@@ -12,8 +12,9 @@
 import { ResolvedConfig } from '../../config.js';
 import { KeyringStore } from '../../store/KeyringStore.js';
 import { createStore } from '../../store/StoreFactory.js';
-import { parseKeyStore, serializeKeyStore, KeyStore } from '../../types.js';
-import { mergeKeyStores, normalizeDefaults } from '../../vault/merge.js';
+import { parseKeyStore, KeyStore } from '../../types.js';
+import { vaultFor } from '../../api.js';
+import { copyKeyStore } from '../../vault/transfer.js';
 import { hasFlag, flagValue } from '../main.js';
 
 function describeEntry(alias: string, entry: KeyStore[string]): string {
@@ -59,8 +60,10 @@ export async function cmdImport(argv: string[], config: ResolvedConfig): Promise
         return 1;
     }
 
-    const source = parseKeyStore(sourceBlob);
-    if (source === null) {
+    const parsed = parseKeyStore(sourceBlob);
+    let source: KeyStore;
+    try { source = copyKeyStore(parsed); }
+    catch {
         process.stderr.write('Nothing to import: the source is not a valid keystore.\n');
         return 1;
     }
@@ -75,40 +78,11 @@ export async function cmdImport(argv: string[], config: ResolvedConfig): Promise
         return 0;
     }
 
-    // 3. Merge into the destination rather than replacing it.
     const dest = createStore(config);
-    const { blob: existingBlob } = await dest.read();
-    const existing = existingBlob === null ? {} : (parseKeyStore(existingBlob) ?? {});
-
-    const collisions = aliases.filter((a) => existing[a] !== undefined);
-    if (collisions.length > 0 && !overwrite) {
-        process.stdout.write(
-            `\nSkipping ${collisions.length} alias(es) already present: ${collisions.join(', ')}\n` +
-                `Use --overwrite to replace them.\n`,
-        );
-    }
-
-    const incoming: KeyStore = { ...existing };
-    let imported = 0;
-    for (const alias of aliases) {
-        if (existing[alias] !== undefined && !overwrite) continue;
-        incoming[alias] = source[alias]!;
-        imported++;
-    }
-
-    // allowRemovals stays false: an import must never delete anything.
-    const { merged } = mergeKeyStores(existing, incoming, existing, { allowRemovals: false });
-    const preferred = Object.keys(source).find((a) => source[a]?.isDefault);
-    const finalStore = normalizeDefaults(merged, preferred);
-
-    await dest.write(serializeKeyStore(finalStore));
-
-    // 4. Verify the round trip rather than trusting the write.
-    const { blob: verifyBlob } = await dest.read();
-    const verified = verifyBlob === null ? null : parseKeyStore(verifyBlob);
-    if (verified === null || Object.keys(verified).length !== Object.keys(finalStore).length) {
-        process.stderr.write('Import wrote but could not be verified by reading back. Check `sn-credstore doctor`.\n');
-        return 1;
+    const vault = vaultFor(config);
+    const { imported, skipped, verified } = await vault.importCredentialSnapshot(source, overwrite);
+    if (skipped.length > 0) {
+        process.stdout.write(`\nSkipping ${skipped.length} alias(es) already present: ${skipped.join(', ')}\nUse --overwrite to replace them.\n`);
     }
 
     process.stdout.write(

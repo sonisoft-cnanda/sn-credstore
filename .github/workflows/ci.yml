@@ -45,6 +45,9 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      - name: Headless credential transfer contention and recovery
+        run: node scripts/verify-credential-transfer.mjs
+
       # The dual build is the fragile part: preload.cjs must stay requireable
       # from CommonJS and the ESM entry must stay importable. Assert both rather
       # than trusting that tsc emitted something sensible.

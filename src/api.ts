@@ -6,14 +6,16 @@
  * Everything here returns data; nothing prints. Rendering belongs to the caller,
  * because oclif wants structured output and the zero-dep CLI wants plain text.
  *
- * Nothing here reveals a secret. `listAliases` returns metadata only, which is
- * what a `--json` flag ends up piping into a log file.
+ * `listAliases` returns metadata only. Credential transfer explicitly returns
+ * secrets; callers must keep snapshots out of logs and persist them securely.
  */
 import { ResolvedConfig, loadConfig } from './config.js';
 import { createStore } from './store/StoreFactory.js';
 import { CredentialVault } from './vault/CredentialVault.js';
 import { KeyStore, parseKeyStore, serializeKeyStore } from './types.js';
 import { normalizeDefaults } from './vault/merge.js';
+import type { CredentialChange } from './vault/transfer.js';
+export type { CredentialChange } from './vault/transfer.js';
 
 /** Per-alias metadata, with every secret field omitted rather than masked. */
 export interface AliasInfo {
@@ -87,6 +89,22 @@ export async function listAliases(config: ResolvedConfig = loadConfig()): Promis
         path: config.blobPath,
         aliases: toAliasInfo(parsed),
     };
+}
+
+/** Read a strictly validated deep copy containing secrets. Never log this snapshot. */
+export async function readCredentialSnapshot(config: ResolvedConfig = loadConfig()): Promise<KeyStore> {
+    return vaultFor(config).readCredentialSnapshot();
+}
+
+/**
+ * Apply exact expected replacements under one lock; new aliases are not default.
+ * After a write or verification error, read a fresh snapshot before retrying.
+ */
+export async function applyCredentialChanges(
+    changes: readonly CredentialChange[],
+    config: ResolvedConfig = loadConfig(),
+): Promise<void> {
+    await vaultFor(config).applyCredentialChanges(changes);
 }
 
 /** Set the default alias. Returns false if the alias does not exist. */
