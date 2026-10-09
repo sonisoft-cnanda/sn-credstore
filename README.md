@@ -442,3 +442,7 @@ complete SDK fields, matching entry aliases, and safe object keys; duplicate
 changes and prototype-related aliases are rejected. CLI import uses the same
 lock and preserves existing defaults; the first import selects a source default
 in the same atomic write (or the first alias if the source has none).
+
+Legacy basic credentials may also contain `host`, which must be a nonempty
+string exactly equal to `instanceUrl`. Transfers preserve this field; other
+unknown fields remain invalid.

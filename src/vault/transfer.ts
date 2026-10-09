@@ -1,4 +1,4 @@
-import { Creds, KeyStore } from '../types.js';
+import { BasicCred, Creds, KeyStore } from '../types.js';
 import { StoreCorruptError } from '../errors.js';
 import { isPlausibleExpiresAtSeconds } from '../validate.js';
 
@@ -37,8 +37,17 @@ export function copyCreds(value: unknown): Creds {
     const creds = record(value);
     const instanceUrl = stringOf(creds.instanceUrl);
     if (creds.type === 'basic') {
-        fields(creds, ['type', 'instanceUrl', 'username', 'password']);
-        return { type: 'basic', instanceUrl, username: stringOf(creds.username), password: stringOf(creds.password) };
+        const names = ['type', 'instanceUrl', 'username', 'password'];
+        const hasHost = Object.hasOwn(creds, 'host');
+        if (hasHost) names.push('host');
+        fields(creds, names);
+        const copied: BasicCred = { type: 'basic', instanceUrl, username: stringOf(creds.username), password: stringOf(creds.password) };
+        if (hasHost) {
+            const host = stringOf(creds.host);
+            if (host !== instanceUrl) invalid();
+            copied.host = host;
+        }
+        return copied;
     }
     if (creds.type !== 'oauth') invalid();
     fields(creds, ['type', 'instanceUrl', 'access_token', 'token_type', 'refresh_token', 'expires_at']);
