@@ -24,12 +24,17 @@ const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
         await run(['cp', resolve('dist'), dockerContainer + ':' + directory + '/dist']);
         await run(['cp', resolve('package.json'), dockerContainer + ':' + directory + '/package.json']);
         const script = `
-            import {listAliases} from '${directory}/dist/esm/index.js';
+            import {listAliases,readCredentialSnapshot,applyCredentialChanges} from '${directory}/dist/esm/index.js';
             import {createStore} from '${directory}/dist/esm/store/StoreFactory.js';
             import {loadConfig} from '${directory}/dist/esm/config.js';
             const config=loadConfig();
             if((await listAliases(config)).path!==process.env.SN_CRED_STORE_PATH) throw new Error('Sandbox mismatch');
             await createStore(config).write('{}');
+            const legacy={type:'basic',instanceUrl:'https://example.invalid',host:'https://example.invalid',username:'fixture',password:'fabricated-password'};
+            await applyCredentialChanges([{alias:'legacy',expected:null,creds:legacy}],config);
+            await applyCredentialChanges([{alias:'unrelated',expected:null,creds:{...legacy}}],config);
+            const snapshot=await readCredentialSnapshot(config);
+            if(snapshot.legacy.creds.host!==legacy.host||snapshot.unrelated.creds.host!==legacy.host)throw new Error('Legacy host was lost');
             let refused=false;
             try {await createStore({...config,store:'systemd-creds'}).read();} catch {refused=true;}
             if(!refused) throw new Error('Encrypted backend did not refuse');
@@ -150,6 +155,27 @@ afterAll(async () => {
 });
 
 describe('headless session', () => {
+    it('preserves legacy basic fields in a stripped-session transfer', async () => {
+        const script = `
+            import {loadConfig,listAliases,readCredentialSnapshot,applyCredentialChanges,setDefaultAlias} from './dist/esm/index.js';
+            const config=loadConfig();
+            if(config.blobPath!==process.env.SN_CRED_STORE_PATH||(await listAliases(config)).path!==config.blobPath)throw new Error('Sandbox mismatch');
+            const legacy={type:'basic',instanceUrl:'https://example.invalid',host:'https://example.invalid',username:'fixture',password:'fabricated-password'};
+            await applyCredentialChanges([{alias:'legacy',expected:null,creds:legacy}],config);
+            await setDefaultAlias('legacy',config);
+            const copy=await readCredentialSnapshot(config);
+            copy.legacy.creds.host='https://copy.invalid';
+            await applyCredentialChanges([{alias:'added',expected:null,creds:legacy}],config);
+            const snapshot=await readCredentialSnapshot(config);
+            if(snapshot.legacy.creds.host!==legacy.host||snapshot.added.creds.host!==legacy.host||!snapshot.legacy.isDefault||snapshot.added.isDefault)throw new Error('Legacy transfer invariant failed');
+            process.stdout.write('legacy-transfer-verified');
+        `;
+        const out = await runHeadless(process.execPath, ['--input-type=module', '-e', script],
+            headlessEnv({ SN_CRED_STORE: 'file', SN_CRED_STORE_PATH: join(dir, 'legacy-transfer.json') }));
+        expect(out).toContain('legacy-transfer-verified');
+        expect(out).not.toContain('fabricated-password');
+    });
+
     it('reports the run-owned store path before any mutation-capable command', async () => {
         const out = await runHeadless(
             process.execPath,

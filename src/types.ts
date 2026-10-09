@@ -1,7 +1,6 @@
 /**
- * These types mirror `@servicenow/sdk-cli`'s auth types EXACTLY. Do not "improve"
- * them — the whole design depends on us being able to hand the SDK back a blob it
- * produced, byte-compatibly. Source of truth:
+ * These types preserve SDK credential blobs, including the redundant basic
+ * `host` field retained by older stores. Current SDK shape source of truth:
  *   node_modules/@servicenow/sdk-cli/dist/auth/index.d.ts
  *
  * Verified through @servicenow/sdk-cli 4.13.3. The keychain and stored auth
@@ -13,6 +12,8 @@
 /** Basic auth. Note the password is stored in CLEARTEXT inside the blob. */
 export interface BasicCred {
     instanceUrl: string;
+    /** Legacy stored field; transfer validation requires exact equality to instanceUrl. */
+    host?: string;
     type: 'basic';
     username: string;
     password: string;

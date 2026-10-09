@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { applyCredentialChanges, CredentialChange, listAliases, readCredentialSnapshot, vaultFor } from '../../../src/api.js';
 import { loadConfig, ResolvedConfig } from '../../../src/config.js';
-import { Creds, KeyStore, OAuthCred } from '../../../src/types.js';
+import { BasicCred, Creds, KeyStore, OAuthCred } from '../../../src/types.js';
 import { CredentialConflictError } from '../../../src/errors.js';
 import { FileStore } from '../../../src/store/FileStore.js';
 import { CredentialVault } from '../../../src/vault/CredentialVault.js';
@@ -15,7 +15,7 @@ let directory: string;
 let config: ResolvedConfig;
 let previousPath: string | undefined;
 let previousStore: string | undefined;
-const basic = (password = 'fabricated-password'): Creds => ({ type: 'basic', instanceUrl: 'https://example.invalid', username: 'fixture', password });
+const basic = (password = 'fabricated-password'): BasicCred => ({ type: 'basic', instanceUrl: 'https://example.invalid', username: 'fixture', password });
 const oauth = (remaining: number, token = 'fabricated-access'): OAuthCred => ({ type: 'oauth', instanceUrl: 'https://example.invalid', access_token: token,
     refresh_token: 'fabricated-refresh', token_type: 'Bearer', expires_at: Math.floor(Date.now() / 1000) + remaining });
 
@@ -63,6 +63,80 @@ function cli(input: unknown, args: string[] = []): Promise<number | null> {
 }
 
 describe('credential transfer', () => {
+    it('preserves redundant legacy basic host fields through snapshots and mixed-alias writes', async () => {
+        const legacy = { ...basic(), host: 'https://example.invalid' };
+        const originalOAuth = oauth(7200);
+        const initial: KeyStore = {
+            legacy: { alias: 'legacy', isDefault: true, creds: legacy },
+            survivor: { alias: 'survivor', isDefault: false, creds: { ...legacy } },
+            selected: { alias: 'selected', isDefault: false, creds: originalOAuth },
+        };
+        await writeFile(config.blobPath, JSON.stringify(initial), { mode: 0o600 });
+        const snapshot = await readCredentialSnapshot();
+        expect(snapshot).toEqual(initial);
+        const copied = snapshot.legacy!.creds;
+        if (copied.type !== 'basic') throw new Error('Fixture mismatch');
+        copied.host = 'https://copy.invalid';
+        copied.password = 'fabricated-copy-password';
+        expect((await readCredentialSnapshot()).legacy!.creds).toEqual(legacy);
+        const replacementOAuth = { ...oauth(3600), access_token: 'fabricated-new-access', refresh_token: 'fabricated-new-refresh' };
+        await applyCredentialChanges([{ alias: 'selected', expected: originalOAuth, creds: replacementOAuth }]);
+        const afterOAuth = await readCredentialSnapshot();
+        expect(afterOAuth.legacy).toEqual(initial.legacy);
+        expect(afterOAuth.survivor).toEqual(initial.survivor);
+        expect(afterOAuth.selected!.creds).toEqual(replacementOAuth);
+        const replacementBasic = { ...legacy, password: 'fabricated-new-basic-password' };
+        await applyCredentialChanges([{ alias: 'legacy', expected: legacy, creds: replacementBasic },
+            { alias: 'added', expected: null, creds: legacy }]);
+        const final = await readCredentialSnapshot();
+        expect(final.legacy!.creds).toEqual(replacementBasic);
+        expect(final.legacy!.isDefault).toBe(true);
+        expect(final.added!.creds).toEqual(legacy);
+        expect(final.added!.isDefault).toBe(false);
+        expect(final.survivor).toEqual(initial.survivor);
+        expect(final.selected!.creds).toEqual(replacementOAuth);
+        expect((JSON.parse(await readFile(config.blobPath, 'utf8')) as KeyStore).survivor).toEqual(initial.survivor);
+    });
+
+    it('imports and replaces legacy basic credentials without dropping their host field', async () => {
+        const legacy = { ...basic(), host: 'https://example.invalid' };
+        const source = { legacy: { alias: 'legacy', isDefault: true, creds: legacy } };
+        expect(await cli(source)).toBe(0);
+        expect((await readCredentialSnapshot()).legacy!.creds).toEqual(legacy);
+        const replaced = { ...legacy, password: 'fabricated-import-replacement' };
+        expect(await cli({ legacy: { ...source.legacy, creds: replaced } }, ['--overwrite'])).toBe(0);
+        expect((await readCredentialSnapshot()).legacy).toEqual({ ...source.legacy, creds: replaced });
+    });
+
+    it.each([
+        ['undefined', undefined], ['null', null], ['number', 42], ['empty', ''],
+        ['mismatch', 'https://different.invalid'], ['trailing-slash', 'https://example.invalid/'],
+        ['case-difference', 'https://EXAMPLE.invalid'], ['object', {}], ['array', []],
+    ])('rejects invalid legacy basic host %s without writes', async (_label, host) => {
+        await seed();
+        const before = await readFile(config.blobPath, 'utf8');
+        const invalidCreds = { ...basic(), host } as unknown as Creds;
+        await expect(applyCredentialChanges([{ alias: 'added', expected: null, creds: invalidCreds }])).rejects.toMatchObject({ code: 'STORE_CORRUPT' });
+        expect(await readFile(config.blobPath, 'utf8')).toBe(before);
+        if (host !== undefined) {
+            const malformed = JSON.stringify({ legacy: { alias: 'legacy', isDefault: true, creds: invalidCreds } });
+            await writeFile(config.blobPath, malformed, { mode: 0o600 });
+            await expect(readCredentialSnapshot()).rejects.toMatchObject({ code: 'STORE_CORRUPT' });
+            expect(await readFile(config.blobPath, 'utf8')).toBe(malformed);
+        }
+        expect((await readdir(directory)).some(name => name.includes('.pending-'))).toBe(false);
+    });
+
+    it.each([
+        { ...basic(), host: 'https://example.invalid', extra: 'unknown' },
+        { ...oauth(3600), host: 'https://example.invalid' },
+    ])('keeps unknown basic fields and OAuth host invalid', async creds => {
+        await seed();
+        const before = await readFile(config.blobPath, 'utf8');
+        await expect(applyCredentialChanges([{ alias: 'added', expected: null, creds }])).rejects.toMatchObject({ code: 'STORE_CORRUPT' });
+        expect(await readFile(config.blobPath, 'utf8')).toBe(before);
+    });
+
     it('returns secret-bearing independent snapshots and leaves new aliases non-default', async () => {
         await seed();
         const snapshot = await readCredentialSnapshot();
