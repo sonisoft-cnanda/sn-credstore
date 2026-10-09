@@ -37,6 +37,7 @@ export {
     StoreUnavailableError,
     StoreDecryptError,
     StoreCorruptError,
+    CredentialConflictError,
     LockTimeoutError,
     ReadOnlyStoreError,
     PlaintextNotPermittedError,
@@ -65,8 +66,10 @@ export {
     deleteAlias,
     deleteAllAliases,
     vaultFor,
+    readCredentialSnapshot,
+    applyCredentialChanges,
 } from './api.js';
-export type { AliasInfo, StoreSummary } from './api.js';
+export type { AliasInfo, StoreSummary, CredentialChange } from './api.js';
 
 export { redact, maskValue, sanitizeProcessError } from './redact.js';
 export { logger } from './logger.js';

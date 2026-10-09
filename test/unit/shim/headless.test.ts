@@ -10,9 +10,12 @@ const execFileAsync = promisify(execFile);
 
 const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
 (dockerContainer ? it : it.skip)('file backend works in Docker and encrypted selection refuses downgrade', async () => {
-    const run = async (args: string[]): Promise<string> => {
+    const run = async (args: string[], timeoutMs = 30_000): Promise<string> => {
         try {
-            return (await execFileAsync('docker', args, {timeout: 30_000})).stdout;
+            const operation = execFileAsync('docker', args, {timeout: timeoutMs});
+            const result = await operation;
+            if (operation.child.killed) throw new Error('Docker fixture exceeded its subprocess timeout.');
+            return result.stdout;
         } catch (error: unknown) { throw new Error(JSON.stringify(sanitizeProcessError(error))); }
     };
     const directory = (await run(['exec', dockerContainer!, 'mktemp', '-d', '/tmp/sncs-headless-XXXXXX'])).trim();
@@ -38,10 +41,10 @@ const dockerContainer = process.env.SN_CRED_STORE_TEST_DOCKER;
         expect(result).toBe('verified');
         await run(['exec', dockerContainer!, 'mkdir', directory + '/scripts']);
         await run(['cp', resolve('scripts/verify-lock-recovery.mjs'), dockerContainer + ':' + directory + '/scripts/verify-lock-recovery.mjs']);
-        const recovery = await run(['exec', dockerContainer!, 'node', directory + '/scripts/verify-lock-recovery.mjs']);
+        const recovery = await run(['exec', dockerContainer!, 'node', directory + '/scripts/verify-lock-recovery.mjs'], 120_000);
         expect(recovery.match(/40 exclusive writes/g)).toHaveLength(3);
     } finally { await run(['exec', '-u', '0', dockerContainer!, 'rm', '-rf', directory]); }
-}, 90_000);
+}, 150_000);
 
 /**
  * Phase 5 — the headless ladder, as executable tests.

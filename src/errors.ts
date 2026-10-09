@@ -16,6 +16,7 @@ export type CredentialStoreErrorCode =
     | 'READ_ONLY_STORE'
     | 'PLAINTEXT_NOT_PERMITTED'
     | 'CLOBBER_REFUSED'
+    | 'CREDENTIAL_CONFLICT'
     | 'SHIM_PRECONDITION_FAILED';
 
 export class CredentialStoreError extends Error {
@@ -59,6 +60,16 @@ export class StoreDecryptError extends CredentialStoreError {
 export class StoreCorruptError extends CredentialStoreError {
     constructor(message: string, remediation: string, options: { storeId?: string; cause?: unknown } = {}) {
         super('STORE_CORRUPT', message, remediation, options);
+    }
+}
+
+/** Expected credentials changed; no requested replacement was written. */
+export class CredentialConflictError extends CredentialStoreError {
+    readonly aliases: readonly string[];
+
+    constructor(aliases: readonly string[]) {
+        super('CREDENTIAL_CONFLICT', `Credential aliases changed: ${aliases.join(', ')}.`, 'Read a fresh credential snapshot and review the replacements before retrying.');
+        this.aliases = Object.freeze([...aliases]);
     }
 }
 

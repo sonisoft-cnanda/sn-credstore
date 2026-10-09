@@ -9,7 +9,8 @@ import { mergeKeyStores } from './merge.js';
 import { acquireLock } from '../lock/FileLock.js';
 import { lockPathFor } from '../config.js';
 import { logger } from '../logger.js';
-import { StoreCorruptError, StoreUnavailableError } from '../errors.js';
+import { CredentialConflictError, StoreCorruptError, StoreUnavailableError } from '../errors.js';
+import { CredentialChange, copyChanges, copyKeyStore, sameCreds } from './transfer.js';
 import { writeFileAtomic, readFileVersioned, deleteFileIfExists } from '../store/atomicFile.js';
 
 interface Operation {
@@ -27,7 +28,7 @@ interface PendingUpdate {
     allowRemovals: boolean;
 }
 
-type Tokens = Pick<OAuthCred, 'access_token' | 'refresh_token' | 'expires_at' | 'token_type'>;
+type Tokens = Pick<OAuthCred, 'access_token' | 'expires_at' | 'token_type'> & Partial<Pick<OAuthCred, 'refresh_token'>>;
 const fingerprint = (creds: OAuthCred): string => createHash('sha256')
     .update(JSON.stringify([creds.instanceUrl, creds.access_token, creds.refresh_token, creds.expires_at, creds.token_type]))
     .digest('hex');
@@ -93,15 +94,95 @@ export class CredentialVault {
         return blob;
     }
 
+    private async readTransferStore(): Promise<{ store: KeyStore; version: string | null }> {
+        const { blob, version } = await this.store.read();
+        let parsed: unknown = {};
+        if (blob !== null) {
+            try { parsed = JSON.parse(blob); }
+            catch { throw new StoreCorruptError('Invalid credential store JSON.', 'Preserve the store and inspect it with sn-credstore doctor.'); }
+        }
+        return { store: copyKeyStore(parsed), version };
+    }
+
+    /** Return a strictly validated, independent copy containing secrets under the vault lock. */
+    async readCredentialSnapshot(): Promise<KeyStore> {
+        return this.withTransferTransaction(async () => (await this.readTransferStore()).store, 'credential-snapshot');
+    }
+
+    private async withTransferTransaction<T>(fn: () => Promise<T>, op: string): Promise<T> {
+        return this.runTransaction(async () => {
+            if ((await this.pendingSidecars()).length > 0) {
+                throw new StoreUnavailableError('Pending credential recovery is required before credential transfer.', 'Resolve credentials through the SDK to recover pending writes, then retry the transfer.');
+            }
+            return fn();
+        }, op, false, false);
+    }
+
+    private async writeTransferStore(store: KeyStore, version: string | null): Promise<KeyStore> {
+        await this.store.write(serializeKeyStore(store), version);
+        let verified: KeyStore;
+        try {
+            verified = (await this.readTransferStore()).store;
+            if (JSON.stringify(verified) !== JSON.stringify(store)) throw new Error('Verification mismatch');
+        } catch {
+            throw new StoreUnavailableError('Credential transfer may have committed but could not be verified.', 'Read a fresh credential snapshot and inspect the intended replacements before retrying.');
+        }
+        this.lastReadStore = verified;
+        this.operation()!.base = verified;
+        this.remember(verified);
+        return verified;
+    }
+
+    /** Atomically replace exact expected credentials, preserving alias metadata and unrelated entries. */
+    async applyCredentialChanges(changes: readonly CredentialChange[]): Promise<void> {
+        const requested = copyChanges(changes);
+        await this.withTransferTransaction(async () => {
+            const { store, version } = await this.readTransferStore();
+            if (requested.length === 0) return;
+            const conflicts = requested.filter(change => {
+                const current = Object.hasOwn(store, change.alias) ? store[change.alias] : undefined;
+                return change.expected === null ? current !== undefined : !current || !sameCreds(current.creds, change.expected);
+            }).map(change => change.alias);
+            if (conflicts.length) throw new CredentialConflictError(conflicts);
+            for (const change of requested) {
+                const entry = store[change.alias];
+                store[change.alias] = { alias: change.alias, isDefault: entry?.isDefault ?? false, creds: change.creds };
+            }
+            await this.writeTransferStore(store, version);
+        }, 'credential-transfer');
+    }
+
+    /** Import a validated snapshot in one write; the first import adopts a default. Returns secrets. */
+    async importCredentialSnapshot(source: KeyStore, overwrite = false): Promise<{ imported: number; skipped: string[]; verified: KeyStore }> {
+        const incoming = copyKeyStore(source);
+        return this.withTransferTransaction(async () => {
+            const { store, version } = await this.readTransferStore();
+            const empty = Object.keys(store).length === 0;
+            const aliases = Object.keys(incoming);
+            const skipped = aliases.filter(alias => Object.hasOwn(store, alias) && !overwrite);
+            const selected = aliases.filter(alias => !Object.hasOwn(store, alias) || overwrite);
+            const preferred = empty ? aliases.find(alias => incoming[alias]!.isDefault) ?? aliases[0] : undefined;
+            for (const alias of selected) {
+                store[alias] = { alias, isDefault: empty ? alias === preferred : store[alias]?.isDefault ?? false, creds: incoming[alias]!.creds };
+            }
+            const verified = selected.length > 0 ? await this.writeTransferStore(store, version) : store;
+            return { imported: selected.length, skipped, verified };
+        }, 'import');
+    }
+
     /** Run a complete mutation under one lock, with a baseline isolated from sibling calls. */
     async withTransaction<T>(fn: () => Promise<T>, op = 'write', removal = false): Promise<T> {
+        return this.runTransaction(fn, op, removal, true);
+    }
+
+    private async runTransaction<T>(fn: () => Promise<T>, op: string, removal: boolean, recoverPending: boolean): Promise<T> {
         const existing = this.operation();
         if (existing?.locked) return fn();
         const lock = await acquireLock(this.lockPath, { timeoutMs: this.options.lockTimeoutMs, op });
         const operation: Operation = { active: true, locked: true, removal, base: null };
         try {
             return await this.operations.run(operation, async () => {
-                await this.absorbPendingSidecars();
+                if (recoverPending) await this.absorbPendingSidecars();
                 const result = await fn();
                 if (operation.failure) throw operation.failure;
                 return result;
@@ -127,7 +208,7 @@ export class CredentialVault {
                 throw new StoreUnavailableError('Stored alias changed or became ambiguous before refresh.', 'Resolve the selected alias again.');
             }
             const tokens = await refresh({ ...current });
-            const renewed: OAuthCred = { ...current, ...tokens };
+            const renewed: OAuthCred = { ...current, ...tokens, refresh_token: tokens?.refresh_token ?? current.refresh_token };
             if (renewed.expires_at <= Math.floor(Date.now() / 1000)) {
                 throw new StoreUnavailableError('SDK returned expired credentials after refresh.', 'Check instance connectivity and retry.');
             }
@@ -226,13 +307,18 @@ export class CredentialVault {
         logger.error(`Credential update preserved in ${path}; the next successful read will recover it.`);
     }
 
-    private async absorbPendingSidecars(): Promise<void> {
+    private async pendingSidecars(): Promise<string[]> {
         const dir = dirname(this.options.blobPath);
         const prefix = `${basename(this.options.blobPath)}.pending-`;
-        const entries = await readdir(dir).then(names => names.filter(name => name.startsWith(prefix)).sort(), error => {
+        return readdir(dir).then(names => names.filter(name => name.startsWith(prefix)).sort(), error => {
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
             throw error;
         });
+    }
+
+    private async absorbPendingSidecars(): Promise<void> {
+        const dir = dirname(this.options.blobPath);
+        const entries = await this.pendingSidecars();
         if (!entries.length) return;
         if (!this.operation()?.locked) {
             await this.withTransaction(async () => {}, 'recover');
